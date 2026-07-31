@@ -70,7 +70,14 @@ import { poolOf, positionOf } from './mirror.ts'
 import { canonicalDocument } from './questiondoc.ts'
 import { withOutbox, type Db } from './outbox.ts'
 import type { PolicyClient } from './policyclient.ts'
-import { ResolutionError, findResolutionByMarket, planResolution, resolutionLeaseKey, type SourceProbe } from './resolve.ts'
+import {
+  ResolutionError,
+  findResolutionByMarket,
+  planResolution,
+  resolutionLeaseKey,
+  resolutionView,
+  type SourceProbe,
+} from './resolve.ts'
 
 export interface ServerDeps {
   readonly sql: Db
@@ -759,7 +766,9 @@ function buildRoutes(): Route[] {
       const id = uuidParam(ctx, 'id')
       const resolution = await findResolutionByMarket(deps.sql, id)
       if (!resolution) return errorReply(404, 'not_found', 'no resolution has been planned', ctx.requestId)
-      return { status: 200, body: { resolution } }
+      // Narrowed, never the row: the row carries a bigint nonce that JSON.stringify throws on, and
+      // the raw transaction. See `resolutionView` for both defects.
+      return { status: 200, body: { resolution: resolutionView(resolution) } }
     }),
 
     /**

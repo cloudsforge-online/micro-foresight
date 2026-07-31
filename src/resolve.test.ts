@@ -28,6 +28,8 @@ import {
   listOutstandingResolutions,
   planResolution,
   resolutionLeaseKey,
+  resolutionView,
+  type Resolution,
   type ResolveDeps,
 } from './resolve.ts'
 import {
@@ -337,4 +339,52 @@ test('the market is only marked resolved AFTER the chain has accepted it', { ski
   // the database the source of truth for an outcome the contract pays against.
   assert.equal((await findMarket(db(sql), id))?.status, 'closed')
   assert.equal((await findMarket(db(sql), id))?.outcome, null)
+})
+
+test('a signed resolution can actually be serialised — the route used to 500 here', () => {
+  // The regression in full. `oracleNonce` is a bigint and `send()` uses JSON.stringify, which
+  // THROWS on a bigint rather than coercing it. So the route answered correctly only while the
+  // resolution was unsigned, and failed on every call an operator would make. No test covered the
+  // route, so nothing caught it; micro-foresight-admin-web did, by calling it.
+  const signed: Resolution = {
+    id: '11111111-1111-4111-8111-111111111111',
+    marketId: '22222222-2222-4222-8222-222222222222',
+    chain: 'hearth',
+    network: 'testnet',
+    action: 0,
+    rationale: 'the named source published the outcome',
+    state: 'signed',
+    oracleAddress: '0x1111111111111111111111111111111111111111',
+    oracleNonce: 42n,
+    resolverAddress: '0x2222222222222222222222222222222222222222',
+    rawTx: '0xdeadbeef',
+    txHash: null,
+    custodyAuditId: 'audit-1',
+    broadcastAt: null,
+    confirmedAt: null,
+    attempts: 0,
+    lastError: null,
+  }
+
+  // The raw row is the thing that cannot be sent.
+  assert.throws(() => JSON.stringify(signed), TypeError)
+
+  // The view can.
+  const wire = JSON.parse(JSON.stringify(resolutionView(signed))) as Record<string, unknown>
+  assert.equal(wire['oracleNonce'], '42', 'the nonce crosses as a decimal string')
+})
+
+test('the resolution view exposes no part of the signing path', () => {
+  // An operator console needs a resolution's STATE, never its transaction bytes or the addresses
+  // that produced them.
+  const view = resolutionView({
+    id: 'a', marketId: 'b', chain: 'hearth', network: 'testnet', action: 1,
+    rationale: 'r', state: 'planned', oracleAddress: '0xaaa', oracleNonce: null,
+    resolverAddress: '0xbbb', rawTx: '0xdeadbeef', txHash: null, custodyAuditId: 'audit',
+    broadcastAt: null, confirmedAt: null, attempts: 0, lastError: null,
+  } as Resolution)
+  for (const leaked of ['rawTx', 'oracleAddress', 'resolverAddress', 'custodyAuditId']) {
+    assert.equal(leaked in view, false, `${leaked} must not reach an operator's browser`)
+  }
+  assert.equal(JSON.stringify(view).includes('0xdeadbeef'), false)
 })

@@ -78,6 +78,63 @@ export interface Resolution {
   readonly lastError: string | null
 }
 
+/**
+ * The operator-visible half of a resolution.
+ *
+ * TWO DEFECTS IN ONE LINE OF CODE. `GET /markets/:id/resolution` used to return the `Resolution`
+ * row verbatim, and:
+ *
+ *   1. **It 500'd from the moment the oracle signed.** `oracleNonce` is a `bigint`, `send()`
+ *      serialises with `JSON.stringify` (`server.ts:944`), and JSON.stringify THROWS on a bigint
+ *      rather than coercing it. So the route worked for exactly as long as the resolution had not
+ *      been signed — which is to say, it failed on every call an operator would actually make,
+ *      while its tests (which never covered the route) stayed green.
+ *   2. **It exposed the signing path.** `rawTx`, `oracleAddress`, `resolverAddress` and
+ *      `custodyAuditId` are how the resolution gets signed and broadcast; an operator console
+ *      needs to know a resolution's STATE, never its transaction bytes.
+ *
+ * Narrowing fixes both at once, which is why it is one function rather than a serialiser patch: a
+ * bigint replacer bolted onto `send()` would have fixed the 500 and left the exposure, and would
+ * have quietly permitted bigints on every other route, where this estate's convention is that an
+ * amount crosses as a decimal string chosen deliberately, not coerced by a global.
+ *
+ * Found by micro-foresight-admin-web, the first client to call the route.
+ */
+export interface ResolutionView {
+  readonly id: string
+  readonly marketId: string
+  readonly chain: string
+  readonly network: string
+  readonly action: number
+  readonly rationale: string
+  readonly state: ResolutionState
+  /** A decimal string. Never a bigint: see above. */
+  readonly oracleNonce: string | null
+  readonly txHash: string | null
+  readonly broadcastAt: string | null
+  readonly confirmedAt: string | null
+  readonly attempts: number
+  readonly lastError: string | null
+}
+
+export function resolutionView(r: Resolution): ResolutionView {
+  return {
+    id: r.id,
+    marketId: r.marketId,
+    chain: r.chain,
+    network: r.network,
+    action: r.action,
+    rationale: r.rationale,
+    state: r.state,
+    oracleNonce: r.oracleNonce === null ? null : r.oracleNonce.toString(),
+    txHash: r.txHash,
+    broadcastAt: r.broadcastAt === null ? null : r.broadcastAt.toISOString(),
+    confirmedAt: r.confirmedAt === null ? null : r.confirmedAt.toISOString(),
+    attempts: r.attempts,
+    lastError: r.lastError,
+  }
+}
+
 interface ResolutionRow {
   readonly id: string
   readonly market_id: string
