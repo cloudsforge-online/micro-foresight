@@ -344,7 +344,11 @@ export function feeReportHandler(deps: JobDeps): Handler {
     for (const row of pending) {
       try {
         const entry = await deps.ledger.postEntry({
-          kind: 'foresight.settlement_fee',
+          // 'fee_charged', from the ledger's CLOSED kind vocabulary (journal_entries_kind_chk,
+          // ledger/src/migrations.ts:181). The original 'foresight.settlement_fee' was not in the
+          // list and every report died at the constraint — see feePostings' header in
+          // ledgerclient.ts for the full finding.
+          kind: 'fee_charged',
           actor: `service:${deps.producer}`,
           correlationId: row.market_id,
           idempotencyKey: feeIdempotencyKey(row.market_id),

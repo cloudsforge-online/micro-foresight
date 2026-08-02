@@ -95,6 +95,10 @@ before(async () => {
     network: 'testnet',
     defaultFeeBps: 200,
     defaultDisputeWindowSeconds: 86_400,
+    // The engagement programme is deliberately ABSENT here — houseseed.test.ts wires it. What
+    // this file's suite proves about it is only that its absence changes nothing.
+    houseAddress: undefined,
+    engagementPolicies: null,
   }
   server = createServer(deps)
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))

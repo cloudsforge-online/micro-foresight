@@ -549,6 +549,187 @@ export const MIGRATIONS: readonly Migration[] = [
         where reported_at is null;
     `,
   },
+  {
+    version: 8,
+    name: 'house_seeds',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- THE HOUSE SEED — docs/ecosystem/21 §5. The platform as a DISCLOSED, OPINION-FREE
+      -- counterparty in an empty room, and every property of that sentence a schema fact:
+      --
+      --   OPINION-FREE   amount_yes_wei = amount_no_wei, a CHECK. A lopsided seed — the house
+      --                  quietly backing an outcome — is not refused by a handler that could be
+      --                  edited; it is unrepresentable (21 §7.2).
+      --   AT OPEN,       a seed row can only be CREATED while the market is 'approved' (trigger),
+      --   NEVER AFTER    and can only become 'staked' carrying EXACTLY the market's open
+      --                  timestamp (trigger). A house stake conjured after open is
+      --                  unrepresentable in this table (21 §7.1). What no table here can stop is
+      --                  the house ADDRESS staking again later through the public contract —
+      --                  nothing anywhere can stop any address doing that (the honesty note in
+      --                  policyclient.ts) — but such a stake would sit in 'positions' with a
+      --                  block after open, publicly attributable, and would NOT be part of the
+      --                  disclosed seed this table records.
+      --   BOUNDED        per-outcome and per-day ceilings are CHECK/trigger facts here, the SAME
+      --                  NUMBERS micro-admin-api CHECKs on the operator policy
+      --                  (admin-api/src/migrations.ts version 8): 10^21 wei (1,000 EMBER) per
+      --                  outcome side per market, 10^22 wei per side per UTC day (21 §7.3). The
+      --                  operator-tunable caps below the ceilings bind at approval time against
+      --                  admin-api's policy; these are the bounds that hold against a caller
+      --                  with a connection.
+      --
+      -- The money itself is on chain: the house address stakes EMBER into the market contract
+      -- exactly as any bettor does, the mirror ingests the Staked logs into 'positions', and
+      -- opening is REFUSED until the mirror shows the symmetric position this row promises. The
+      -- row is the platform's commitment and its disclosure; the chain is the proof.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create table if not exists house_seeds (
+        market_id      uuid          primary key references markets (id) on delete cascade,
+        -- The published platform address the seed is staked from. Lowercased, as the mirror
+        -- stores stakers, so the open-time comparison is a join and not a normalisation bug.
+        house_address  text          not null,
+        -- Per OUTCOME SIDE, in wei. The symmetric total staked is twice this.
+        amount_yes_wei numeric(78,0) not null,
+        amount_no_wei  numeric(78,0) not null,
+        state          text          not null default 'planned',
+        -- Set at open, to EXACTLY the market's opened_at — the trigger is the enforcement.
+        staked_at      timestamptz,
+        tx_hash_yes    text,
+        tx_hash_no     text,
+        created_at     timestamptz   not null default now(),
+        updated_at     timestamptz   not null default now(),
+
+        constraint house_seeds_amounts_positive check (amount_yes_wei > 0 and amount_no_wei > 0),
+        -- ── 21 §7.2. THE HOUSE EXPRESSES NO OPINION, BY CONSTRUCTION.
+        constraint house_seeds_symmetric check (amount_yes_wei = amount_no_wei),
+        -- ── 21 §7.3, the per-market ceiling: 10^21 wei = 1,000 EMBER per outcome side.
+        --    Mirrored from admin-api's engagement_policies_seed_within_ceiling; the two numbers
+        --    must move together or the operator cap could exceed what this table accepts.
+        constraint house_seeds_within_market_ceiling check (
+          amount_yes_wei <= 1000000000000000000000
+        ),
+        constraint house_seeds_state_known check (state in ('planned','staked')),
+        -- A recorded stake is complete or it is not recorded: the timestamp and both transaction
+        -- hashes become non-null together with the state, so a half-recorded stake cannot exist.
+        constraint house_seeds_staked_is_complete check (
+          ((state = 'staked') = (staked_at is not null))
+          and ((state = 'staked') = (tx_hash_yes is not null))
+          and ((state = 'staked') = (tx_hash_no is not null))
+        ),
+        constraint house_seeds_address_shape check (house_address ~ '^0x[0-9a-f]{40}$')
+      );
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- 21 §7.1: A HOUSE STAKE AFTER MARKET OPEN IS UNREPRESENTABLE.
+      --
+      -- INSERT: only while the market is 'approved' — after a person approved it (the state the
+      -- schema already refuses to fake: markets_unapproved_never_opens), and before it opened.
+      -- An insert against an open, closed, resolved, settled or void market raises, whoever is
+      -- holding the connection.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create or replace function house_seeds_only_before_open() returns trigger
+        language plpgsql
+      as $$
+      declare
+        market_status text;
+      begin
+        select status into market_status from markets where id = new.market_id;
+        if market_status is null then
+          raise exception 'house seed names market %, which does not exist', new.market_id
+            using errcode = 'foreign_key_violation';
+        end if;
+        if market_status <> 'approved' then
+          raise exception 'a house seed is planned at approval; the market is % and a house stake after open is unrepresentable (21 §7.1)', market_status
+            using errcode = 'check_violation';
+        end if;
+        if new.state <> 'planned' then
+          raise exception 'a house seed is born planned; staked is a transition the open performs (21 §5)'
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists house_seeds_only_before_open on house_seeds;
+      create trigger house_seeds_only_before_open
+        before insert on house_seeds
+        for each row execute function house_seeds_only_before_open();
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- 21 §5: "a trigger enforces that house stakes carry the market's open timestamp."
+      --
+      -- UPDATE: the only transition is planned → staked, in the same transaction that opens the
+      -- market (status must already be 'open'), with staked_at EQUAL to markets.opened_at — not
+      -- near it, equal to it. Amounts may be adjusted only while still planned and the market
+      -- still 'approved' (an operator resizing an unstaked plan); a recorded stake is immutable,
+      -- because it is the disclosure the market page shows.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create or replace function house_seeds_carry_open_timestamp() returns trigger
+        language plpgsql
+      as $$
+      declare
+        market_status text;
+        market_opened timestamptz;
+      begin
+        if old.state = 'staked' then
+          raise exception 'a recorded house stake is immutable — it is the disclosure the market page shows (21 §5)'
+            using errcode = 'check_violation';
+        end if;
+        select status, opened_at into market_status, market_opened
+          from markets where id = new.market_id;
+        if new.state = 'staked' then
+          if market_status <> 'open' or market_opened is null then
+            raise exception 'a house seed is recorded staked in the transaction that opens the market; the market is %', market_status
+              using errcode = 'check_violation';
+          end if;
+          if new.staked_at is distinct from market_opened then
+            raise exception 'a house stake carries the market''s open timestamp exactly (21 §5): % is not %', new.staked_at, market_opened
+              using errcode = 'check_violation';
+          end if;
+        else
+          -- Still planned: amounts may move, but only while the market can still be seeded.
+          if market_status <> 'approved'
+             and (new.amount_yes_wei is distinct from old.amount_yes_wei
+                  or new.amount_no_wei is distinct from old.amount_no_wei) then
+            raise exception 'a planned seed can only be resized while the market is approved; it is %', market_status
+              using errcode = 'check_violation';
+          end if;
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists house_seeds_carry_open_timestamp on house_seeds;
+      create trigger house_seeds_carry_open_timestamp
+        before update on house_seeds
+        for each row execute function house_seeds_carry_open_timestamp();
+
+      -- ── 21 §7.3, the per-day ceiling: at most 10^22 wei per outcome side planned per UTC day,
+      --    whatever route — or connection — plans them. The operator's (lower) per-day cap from
+      --    admin-api's policy is enforced at approval time in the route; this is the hard bound.
+      create or replace function house_seeds_daily_ceiling() returns trigger
+        language plpgsql
+      as $$
+      declare
+        planned_today numeric;
+      begin
+        select coalesce(sum(amount_yes_wei), 0) into planned_today
+          from house_seeds
+         where date_trunc('day', created_at at time zone 'utc')
+             = date_trunc('day', now() at time zone 'utc');
+        if planned_today + new.amount_yes_wei > 10000000000000000000000 then
+          raise exception 'the day''s house seeds would exceed the 10^22 wei per-side ceiling (21 §7.3)'
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists house_seeds_daily_ceiling on house_seeds;
+      create trigger house_seeds_daily_ceiling
+        before insert on house_seeds
+        for each row execute function house_seeds_daily_ceiling();
+    `,
+  },
 ]
 
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)
@@ -561,6 +742,7 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, for the test harness's truncate. Order is child-first. */
 export const TABLES: readonly string[] = Object.freeze([
+  'house_seeds',
   'fee_reports',
   'resolutions',
   'mirror_cursors',

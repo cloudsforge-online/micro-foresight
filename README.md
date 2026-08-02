@@ -293,14 +293,76 @@ against another file's inserts.
 | `GET` | `/livez` `/readyz` `/metrics` | Health. `/livez` is static by design. |
 | `GET` | `/categories` | The allowlist and the refusals. **Public**: a refusal list behind a token is one nobody can hold the platform to. |
 | `GET` | `/markets` | Browse. |
-| `GET` | `/markets/:id` | Detail: the pool with its `asOf`, the canonical document and its hash, and the idea's cited sources. |
+| `GET` | `/markets/:id` | Detail: the pool with its `asOf`, the canonical document and its hash, the idea's cited sources, and **the house-seed disclosure** whenever one exists. |
 | `GET` | `/markets/:id/positions/:address` | A mirrored position, with `asOf` repeated. |
 | `POST` | `/markets/:id/stake-intent` | Contract address + calldata + policy verdict. **Fails closed.** No money passes through. |
 | `GET`/`POST`/`PATCH` | `/ideas`, `/ideas/:id/approve`, `/ideas/:id/discard` | The operator queue. |
-| `POST` | `/markets`, `/markets/:id/approve`, `/markets/:id/open` | The lifecycle, operator-only. |
+| `POST` | `/markets`, `/markets/:id/approve`, `/markets/:id/open` | The lifecycle, operator-only. `approve` may carry `houseSeedPerOutcomeWei`; `open` refuses a seeded market until the house money is in the pool. |
 | `POST` | `/markets/:id/deploy` | **202** and a status URL. Reaches no chain. Requires `Idempotency-Key`. |
 | `POST` | `/markets/:id/resolve` | **202**. Plans the resolution — and turns it into a `void` if the named source is gone. |
 | `POST` | `/markets/:id/void` | Off-chain void, for a market with no contract yet. A deployed market voids through the oracle. |
+
+---
+
+## The house seed: a disclosed, opinion-free counterparty
+
+A parimutuel market with one bettor is a refund machine — the lone winner splits a pool containing
+only their own stake, so nobody's first bet can ever be interesting. `docs/ecosystem/21` decides
+the platform may put its own money in first, and §5 gives the shape: **symmetric, at open, never
+after, and labelled on the surface where users see it.** Every clause of that sentence is a schema
+fact here, not a handler's opinion — migration 8, `src/migrations.ts`:
+
+| The claim (21 §5, §7) | The line that makes it unrepresentable |
+| --- | --- |
+| The house expresses **no opinion** | `house_seeds_symmetric` — `amount_yes_wei = amount_no_wei`, a CHECK. A lopsided seed does not fail review; it fails to insert (§7.2). |
+| A house stake **after open** cannot exist | trigger `house_seeds_only_before_open` — a seed may only be INSERTed while the market is `approved`. Against an `open` market it raises, connection in hand (§7.1). |
+| A house stake **carries the market's open timestamp** | trigger `house_seeds_carry_open_timestamp` — `staked` demands the market be `open` and `staked_at` be **equal** to `markets.opened_at`. Equality, not proximity. |
+| A recorded stake is **immutable** | same trigger — it is the disclosure the market page shows, so it cannot be edited after the fact. |
+| A **half-recorded** stake cannot exist | `house_seeds_staked_is_complete` — state, timestamp and both transaction hashes become true together. |
+| Seeds are **bounded** | `house_seeds_within_market_ceiling` (10²¹ wei = 1,000 EMBER per outcome side) and trigger `house_seeds_daily_ceiling` (10²² wei per side per UTC day) — the same numbers `micro-admin-api` CHECKs on the operator policy (§7.3). |
+
+All seven are fire-tested with raw SQL in `src/houseseed.test.ts`, routes bypassed.
+
+**This service still never touches the money, and the seed is not an exception.** The house is an
+ordinary bettor with a *published* address (`FORESIGHT_HOUSE_ADDRESS`, disclosed the way the
+platform miners' coinbases are — 21 §3). It stakes through the same `stake(uint8)` everyone uses,
+its position is mirrored into `positions` like anyone's, the contract's `payoutOf` counts it like
+anyone's, and its winnings return through `claim()`/`claimFor()`
+(`src/contracts/ForesightMarket.sol:431-437`) — so **settlement composes rather than forks**:
+there is no house-specific path in resolution, settlement or payout, because the house is not a
+special case anywhere on chain.
+
+That is also the only design custody admits, and it is worth stating rather than discovering:
+`stake(uint8)` is a value-bearing contract CALL, and custody's three EVM shapes are creation
+(value must be zero — `custody/src/signing.ts:210-227`), plain value transfer (data must be empty
+— `:231-260`) and sweep. None of them can call a contract with value; it is the same constraint
+that makes the oracle act through a constructor. So the house key lives outside this estate's
+custody, and a seeder *contract* is refused on its own terms: the contract would be the staker,
+and its winnings would strand at an address with no key.
+
+**Opening a seeded market is refused until the money is already in the pool.**
+`recordHouseStake` compares the plan against the mirror and demands the *exact* symmetric position
+from the house address — not at-least, exactly, because an overshoot would make the disclosure
+understate the house. So "open, with a seed" is a fact about the pool, never an intention.
+
+**The caps bind twice.** The hard ceilings above hold against anyone with a connection. The
+operator-tunable sizes below them live in `micro-admin-api`'s `engagement_policies` (21 §4 puts
+cross-service operator state there, and §8 is blunt that *nothing may move before the caps
+exist*), and are read at approval time through `src/adminapiclient.ts` — **fail closed**, exactly
+like the stake-intent policy gate: an unreadable cap refuses the seed with 503 and a retry hint,
+never a default. Plain approval is untouched by that outage, because an unreachable operator
+surface must not stop ordinary markets.
+
+**Unconfigured is a supported mode.** With no `FORESIGHT_HOUSE_ADDRESS` or no `ADMIN_API_URL`,
+this deployment runs no engagement programme: approving with a seed refuses with a sentence saying
+so, and everything else behaves exactly as it did.
+
+**One recorded divergence from the document.** 21 §5 words the disclosure in Shards
+(*"CloudsForge seeded this pool with X Shards"*). The pool this seed sits in is EMBER wei on a
+public chain, and converting through an administered price would make the disclosed number move
+without anybody staking anything. The honest unit is the pool's own, so the served sentence says
+EMBER. It is composed once, in `houseSeedView`, and served — never left for each client to
+improvise.
 
 ---
 
@@ -316,3 +378,31 @@ against another file's inserts.
   *reachable*; whether it says yes or no is a judgement an operator makes and types in, with a
   rationale. A service that scraped a number and settled money on it is a far larger thing to get
   wrong than anything else in this repository.
+- **A job that stakes the house seed.** The seed is staked from a wallet the platform controls
+  outside this estate's custody (see above), so this service *records and gates* the seed rather
+  than sending it. Automating the send would need a custody transaction shape that does not exist
+  and should not be widened for this.
+- **`foresight-web` rendering the disclosure.** Phase 1 serves it on `GET /markets/:id` — the
+  sentence, the amounts, the address and the on-chain evidence hashes — and pins its presence
+  with force in `houseseed.test.ts`. Rendering it is a later client pass in the same programme,
+  and 21 §7.6's proof is only half-held until that lands.
+
+### Found while reading, reported not fixed
+
+**Every settlement-fee report this service has ever attempted would have been refused by the
+ledger, three ways at once.** Found by re-reading `feePostings` against the ledger's source during
+the engagement-treasury wave; corrected here in the same change, because two of the three were
+this repository's own:
+
+1. `subject: 'chain:<id>'` was not in the account grammar — `parseAccountSubject` threw inside the
+   ledger's `ensureAccount` (`ledger/src/accounts.ts:104`). **Fixed at the root** in
+   `micro-contracts`: the subject was the right one and the grammar now registers it.
+2. `purpose: 'clearing'` is a *type*, not a purpose — `accounts_purpose_chk`
+   (`ledger/src/migrations.ts:130`) refuses it. The transit purpose is `suspense`; the type stays
+   `clearing`, which is also what lets the account sit either side of zero.
+3. `kind: 'foresight.settlement_fee'` was not in the ledger's closed `journal_entries_kind_chk`
+   list (`ledger/src/migrations.ts:181`). The vocabulary is closed precisely so revenue reports
+   can count on it; the right name in it is `fee_charged`.
+
+Nothing needed reconciling — there is no public network yet, so no entry had ever posted. The
+test asserting the old kind was asserting the defect, and was corrected with it.

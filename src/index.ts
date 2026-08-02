@@ -30,6 +30,7 @@ import { CATEGORY_VERSION } from './categories.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, seedRecurring, type JobDeps } from './jobs.ts'
 import { createRelay } from './outbox.ts'
+import { httpAdminApiClient } from './adminapiclient.ts'
 import { httpCustodyClient } from './custodyclient.ts'
 import { httpIndexerClient } from './indexerclient.ts'
 import { httpLedgerClient } from './ledgerclient.ts'
@@ -236,6 +237,12 @@ const server = createServer({
   network: env.network,
   defaultFeeBps: env.defaultFeeBps,
   defaultDisputeWindowSeconds: env.defaultDisputeWindowSeconds,
+  // The house seed — 21 §5. Both may be absent, and absent means "no engagement programme
+  // here": approving with a seed refuses with a sentence rather than degrading into one.
+  houseAddress: env.houseAddress,
+  engagementPolicies: env.adminApiUrl
+    ? httpAdminApiClient({ baseUrl: env.adminApiUrl, token, deadlineMs: env.upstreamDeadlineMs })
+    : null,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

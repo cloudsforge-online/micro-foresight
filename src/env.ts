@@ -150,6 +150,16 @@ function address(source: Source, name: string): string {
   return value
 }
 
+/** An address that may be absent — but a PRESENT value must still be a real address. */
+function optionalAddress(source: Source, name: string): string | undefined {
+  const value = optionalOrUndefined(source, name)
+  if (value === undefined) return undefined
+  if (!EVM_ADDRESS.test(value)) {
+    throw new EnvError(`${name} must be an 0x-prefixed 20-byte address (got ${value.slice(0, 12)}…)`)
+  }
+  return value
+}
+
 export interface Env {
   readonly port: number
   readonly env: string
@@ -200,6 +210,20 @@ export interface Env {
 
   /** Where the settlement fee goes. Bound into every market at deploy time. */
   readonly treasuryAddress: string
+  /**
+   * The published platform address the house seed stakes from — docs/ecosystem/21 §5. **May be
+   * absent, and absent is a supported mode**: this deployment runs no engagement programme and
+   * `POST /markets/:id/approve` refuses a `houseSeedPerOutcomeWei`, plainly. The address holds
+   * its own key OUTSIDE this estate's custody (custody has no transaction shape that can call
+   * `stake(uint8)` — see `src/houseseed.ts`), stakes exactly as any bettor does, and is
+   * published the way the platform miners' coinbase addresses are (21 §3).
+   */
+  readonly houseAddress: string | undefined
+  /**
+   * micro-admin-api, for reading the engagement caps at market approval. Absent is the same
+   * supported mode: no caps readable, no seeds planned (21 §8).
+   */
+  readonly adminApiUrl: string | undefined
   /** The custody-held address that may resolve or void a market. See `src/resolve.ts`. */
   readonly oracleAddress: string
   /** Custody's binding for the oracle key: the userId it was minted under. */
@@ -315,6 +339,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     mainnetEnabled,
 
     treasuryAddress: address(source, 'FORESIGHT_TREASURY_ADDRESS'),
+    houseAddress: optionalAddress(source, 'FORESIGHT_HOUSE_ADDRESS'),
+    adminApiUrl: optionalOrUndefined(source, 'ADMIN_API_URL'),
     oracleAddress: address(source, 'FORESIGHT_ORACLE_ADDRESS'),
     oracleUserId: required(source, 'FORESIGHT_ORACLE_USER_ID'),
     oracleOrderId: required(source, 'FORESIGHT_ORACLE_ORDER_ID'),

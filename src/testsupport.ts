@@ -21,6 +21,7 @@ import { Logger, Metrics } from '@cloudsforge/telemetry'
 import { MIGRATIONS, TABLES } from './migrations.ts'
 import { registerServiceMetrics } from './server.ts'
 import { CATEGORY_VERSION } from './categories.ts'
+import { SeedPolicyUnavailableError, type EngagementPolicyClient, type SeedPolicy } from './adminapiclient.ts'
 import type { CustodyClient, SignRequest } from './custodyclient.ts'
 import type { ActivityItem, IndexerClient, TransactionView } from './indexerclient.ts'
 import type { PolicyClient, PolicyVerdict } from './policyclient.ts'
@@ -326,6 +327,61 @@ export function fakePolicy(): FakePolicy {
       return verdict
     },
   }
+}
+
+export const HOUSE = '0x4444444444444444444444444444444444444444'
+
+export interface FakeSeedPolicyClient extends EngagementPolicyClient {
+  /** The policy admin-api answers with; null is "no seed sizes raised". */
+  setPolicy(policy: SeedPolicy | null): void
+  /** Make admin-api unreachable — the fail-closed path is the point of the seam. */
+  setDown(down: boolean): void
+  readonly reads: number
+}
+
+export function fakeSeedPolicy(initial: SeedPolicy | null = null): FakeSeedPolicyClient {
+  let policy = initial
+  let down = false
+  let reads = 0
+  return {
+    get reads() {
+      return reads
+    },
+    setPolicy(next) {
+      policy = next
+    },
+    setDown(value) {
+      down = value
+    },
+    async foresightSeedPolicy() {
+      reads += 1
+      if (down) throw new SeedPolicyUnavailableError('admin-api could not be reached')
+      return policy
+    },
+  }
+}
+
+/**
+ * Put the house's symmetric stake into the mirror, as the mirror itself would after indexing the
+ * Staked logs. Tx hashes are derived from the market id so two seeded markets never collide with
+ * `positions_source_uniq`.
+ */
+export async function mirrorHouseStake(
+  sql: postgres.Sql,
+  marketId: string,
+  perOutcomeWei: bigint,
+  houseAddress = HOUSE,
+): Promise<{ txYes: string; txNo: string }> {
+  const seed = marketId.replace(/-/g, '')
+  const txYes = `0x${`aa${seed}`.repeat(3).slice(0, 64)}`
+  const txNo = `0x${`bb${seed}`.repeat(3).slice(0, 64)}`
+  await sql`
+    insert into positions (market_id, staker, outcome, amount, tx_hash, log_index, block_height, block_hash)
+    values
+      (${marketId}, ${houseAddress.toLowerCase()}, 0, ${perOutcomeWei.toString()}, ${txYes}, 0, 10, '0xblock10'),
+      (${marketId}, ${houseAddress.toLowerCase()}, 1, ${perOutcomeWei.toString()}, ${txNo}, 1, 10, '0xblock10')
+  `
+  return { txYes, txNo }
 }
 
 /** A source probe with a switch. Being able to make a source vanish is the point of the interface. */

@@ -282,7 +282,10 @@ test('a fee is reported to the ledger from an indexed event, once', { skip }, as
 
   assert.equal(posted.length, 1)
   const entry = posted[0]
-  assert.equal(entry?.kind, 'foresight.settlement_fee')
+  // 'fee_charged' — the ledger's closed journal_entries_kind_chk vocabulary
+  // (ledger/src/migrations.ts:181). The previous expectation pinned a kind the ledger refuses,
+  // which is a test asserting the defect; corrected with the posting fix in ledgerclient.ts.
+  assert.equal(entry?.kind, 'fee_charged')
   // The key is derived from the market id, so a retry replays rather than posting twice.
   assert.equal(entry?.idempotencyKey, feeIdempotencyKey(market.id))
   // A bigint all the way to the wire, and a decimal STRING on it. A JSON number would not survive.

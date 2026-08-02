@@ -70,6 +70,17 @@ import { poolOf, positionOf } from './mirror.ts'
 import { canonicalDocument } from './questiondoc.ts'
 import { withOutbox, type Db } from './outbox.ts'
 import type { PolicyClient } from './policyclient.ts'
+import { SeedPolicyUnavailableError, type EngagementPolicyClient } from './adminapiclient.ts'
+import {
+  HouseSeedError,
+  SEED_PER_DAY_CEILING_WEI,
+  SEED_PER_MARKET_CEILING_WEI,
+  findHouseSeed,
+  houseSeedView,
+  planHouseSeed,
+  recordHouseStake,
+  seedsPlannedTodayWei,
+} from './houseseed.ts'
 import {
   ResolutionError,
   findResolutionByMarket,
@@ -93,6 +104,18 @@ export interface ServerDeps {
   readonly network: Network
   readonly defaultFeeBps: number
   readonly defaultDisputeWindowSeconds: number
+  /**
+   * The published platform address the house seed is staked from — 21 §5. Undefined is a
+   * supported mode: this deployment runs no engagement programme and approving with a seed
+   * refuses, plainly.
+   */
+  readonly houseAddress: string | undefined
+  /**
+   * admin-api's engagement policy, read at approval time to validate a requested seed against
+   * the operator caps. Null when `ADMIN_API_URL` is unset — the same supported mode. See
+   * `adminapiclient.ts` for the recorded decision and the fail-closed rule.
+   */
+  readonly engagementPolicies: EngagementPolicyClient | null
   readonly beforeScrape?: () => Promise<void>
   readonly now?: () => Date
 }
@@ -333,6 +356,20 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
     if (err instanceof MarketError) {
       return errorReply(err.status, err.code, err.message, ctx.requestId)
     }
+    if (err instanceof HouseSeedError) {
+      return errorReply(err.status, err.code, err.message, ctx.requestId)
+    }
+    if (err instanceof SeedPolicyUnavailableError) {
+      // FAIL CLOSED, with a retry hint — the stake-intent shape: the caps could not be read, so
+      // no seed is planned, and the operator is told to try again rather than handed a default.
+      ctx.log.warn('seed refused: admin-api engagement policy was unreachable', { err: err.message })
+      return errorReply(
+        503,
+        'seed_policy_unavailable',
+        'the engagement caps could not be read from admin-api; approving with a seed is refused until they can — retry shortly, or approve without a seed',
+        ctx.requestId,
+      )
+    }
     if (err instanceof ResolutionError) {
       return errorReply(err.status, err.code, err.message, ctx.requestId)
     }
@@ -427,11 +464,17 @@ function buildRoutes(): Route[] {
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       const pool = await poolOf(deps.sql, id, market.chain as ChainId)
       const idea = market.ideaId ? await findIdea(deps.sql, market.ideaId) : null
+      // The house seed DISCLOSURE — 21 §5's sentence, served whenever a house stake exists
+      // (21 §7.6), with the composed sentence, the amounts, the address and the evidence hashes.
+      // Serving it is phase 1; foresight-web rendering it "with force" is the recorded later
+      // client pass.
+      const houseSeed = await findHouseSeed(deps.sql, id)
       return {
         status: 200,
         body: {
           market: publicView(market),
           pool,
+          houseSeed: houseSeed ? houseSeedView(houseSeed) : null,
           document: {
             canonical: canonicalDocument(documentFor(market)),
             hash: market.questionHash,
@@ -663,16 +706,94 @@ function buildRoutes(): Route[] {
       return { status: 201, body: { market: publicView(market) } }
     }),
 
-    /** **A person approves.** The one act the state machine and the schema both insist on. */
+    /**
+     * **A person approves.** The one act the state machine and the schema both insist on.
+     *
+     * The approval may carry `houseSeedPerOutcomeWei` — 21 §5's house seed, sized by the
+     * approving operator and validated HERE against admin-api's engagement policy (the caps,
+     * which 21 §8 says must exist before anything moves), fail closed, before the seed plan is
+     * written in the same transaction as the approval. The schema's own ceilings hold whatever
+     * this handler thinks (`house_seeds_within_market_ceiling`, `house_seeds_daily_ceiling`).
+     */
     define('POST', '/markets/:id/approve', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireAdmin(principal)
       const id = uuidParam(ctx, 'id')
+      const body = await readJson(ctx.req)
       const now = (deps.now ?? (() => new Date()))()
-      const market = await withOutbox(deps.sql, deps.producer, async (tx) =>
-        approveMarket(tx, id, operatorOf(principal), now, ctx.requestId),
-      )
-      return { status: 200, body: { market: publicView(market) } }
+
+      let seedPerOutcomeWei: bigint | null = null
+      if (body['houseSeedPerOutcomeWei'] !== undefined) {
+        seedPerOutcomeWei = requireWei(body, 'houseSeedPerOutcomeWei')
+        if (seedPerOutcomeWei <= 0n || seedPerOutcomeWei > SEED_PER_MARKET_CEILING_WEI) {
+          return errorReply(
+            400,
+            'seed_out_of_range',
+            `houseSeedPerOutcomeWei must be between 1 and ${SEED_PER_MARKET_CEILING_WEI} wei — the schema ceiling refuses more`,
+            ctx.requestId,
+          )
+        }
+        if (!deps.houseAddress) {
+          return errorReply(
+            409,
+            'house_address_unconfigured',
+            'this deployment has no FORESIGHT_HOUSE_ADDRESS, so it runs no house seeds; approve without one',
+            ctx.requestId,
+          )
+        }
+        if (!deps.engagementPolicies) {
+          return errorReply(
+            409,
+            'seed_policy_unconfigured',
+            'this deployment has no ADMIN_API_URL, so the engagement caps cannot be read and no seed may be planned (21 §8: nothing moves before the caps exist)',
+            ctx.requestId,
+          )
+        }
+        // FAIL CLOSED, the stake-intent discipline: an unreadable cap is not a permissive one.
+        const policy = await deps.engagementPolicies.foresightSeedPolicy(ctx.requestId)
+        if (policy === null) {
+          return errorReply(
+            409,
+            'no_seed_policy',
+            'admin-api holds no seed sizes for foresight — raise them through engagement.policy.set first (21 §6)',
+            ctx.requestId,
+          )
+        }
+        if (seedPerOutcomeWei > policy.perMarketWei) {
+          return errorReply(
+            409,
+            'seed_above_policy',
+            `a seed of ${seedPerOutcomeWei} wei per side exceeds the policy's per-market size of ${policy.perMarketWei}`,
+            ctx.requestId,
+          )
+        }
+        const plannedToday = await seedsPlannedTodayWei(deps.sql)
+        if (plannedToday + seedPerOutcomeWei > policy.perDayWei) {
+          return errorReply(
+            409,
+            'seed_daily_cap',
+            `today's seeds already total ${plannedToday} wei per side; adding ${seedPerOutcomeWei} would exceed the policy's per-day size of ${policy.perDayWei}`,
+            ctx.requestId,
+          )
+        }
+      }
+
+      const houseAddress = deps.houseAddress
+      const result = await withOutbox(deps.sql, deps.producer, async (tx) => {
+        const market = await approveMarket(tx, id, operatorOf(principal), now, ctx.requestId)
+        const seed =
+          seedPerOutcomeWei !== null && houseAddress
+            ? await planHouseSeed(tx, { marketId: id, houseAddress, perOutcomeWei: seedPerOutcomeWei })
+            : null
+        return { market, seed }
+      })
+      return {
+        status: 200,
+        body: {
+          market: publicView(result.market),
+          houseSeed: result.seed ? houseSeedView(result.seed) : null,
+        },
+      }
     }),
 
     /**
@@ -714,15 +835,34 @@ function buildRoutes(): Route[] {
       }
     }),
 
+    /**
+     * Open for stakes — and for a seeded market, ONLY once the house money is already in the
+     * pool. `recordHouseStake` refuses unless the mirror shows exactly the planned symmetric
+     * position from the house address, then records the stake with the market's open timestamp
+     * in the same transaction; the `house_seeds` triggers hold both rules against any other
+     * writer. So "open with a seed" is a fact about the pool, never an intention.
+     */
     define('POST', '/markets/:id/open', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireAdmin(principal)
       const id = uuidParam(ctx, 'id')
       const now = (deps.now ?? (() => new Date()))()
-      const market = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
-        openMarket(tx, emit, id, operatorOf(principal), now, ctx.requestId),
-      )
-      return { status: 200, body: { market: publicView(market) } }
+      const result = await withOutbox(deps.sql, deps.producer, async (tx, emit) => {
+        const market = await openMarket(tx, emit, id, operatorOf(principal), now, ctx.requestId)
+        const planned = await findHouseSeed(tx, id)
+        const seed =
+          planned && planned.state === 'planned'
+            ? await recordHouseStake(tx, id, market.openedAt ?? now)
+            : planned
+        return { market, seed }
+      })
+      return {
+        status: 200,
+        body: {
+          market: publicView(result.market),
+          houseSeed: result.seed ? houseSeedView(result.seed) : null,
+        },
+      }
     }),
 
     /**
@@ -904,6 +1044,19 @@ function requireDecimal(body: Record<string, unknown>, field: string): string {
     throw new BadRequestError(`${field} must be a positive decimal string, not a number`)
   }
   return value
+}
+
+/**
+ * A wei amount: a whole-number decimal string, up to numeric(78,0)'s reach. Distinct from
+ * `requireDecimal`, whose 20-digit, fraction-tolerant shape fits whole-EMBER amounts headed for
+ * policy — a wei ceiling is 22 digits, and a fraction of a wei is not a thing.
+ */
+function requireWei(body: Record<string, unknown>, field: string): bigint {
+  const value = body[field]
+  if (typeof value !== 'string' || !/^[0-9]{1,78}$/.test(value)) {
+    throw new BadRequestError(`${field} must be a decimal string of wei, not a number`)
+  }
+  return BigInt(value)
 }
 
 function requireDate(body: Record<string, unknown>, field: string): Date {

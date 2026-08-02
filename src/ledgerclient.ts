@@ -79,6 +79,21 @@ export interface LedgerClient {
  * it is a contract on a chain. So it is booked against a clearing account named for the chain, and
  * the credit is platform fee revenue. This is bookkeeping about somebody else's ledger (the chain's)
  * and the clearing account is what makes that honest: it says "this came from outside".
+ *
+ * ── FOUND DEAD ON ARRIVAL, 2026-08 (the engagement-treasury wave re-read this against the
+ * ledger's source). As first shipped, every fee report was refused by the ledger THREE ways:
+ *   1. subject `chain:<id>` was not in the account grammar — `parseAccountSubject`
+ *      (contracts/packages/money/src/index.ts) threw inside the ledger's `ensureAccount`
+ *      (ledger/src/accounts.ts:104). Fixed at the ROOT: the grammar now registers `chain:<id>`,
+ *      because the subject was the right one.
+ *   2. purpose `'clearing'` is a TYPE, not a purpose — `accounts_purpose_chk`
+ *      (ledger/src/migrations.ts:130) refuses it. The transit purpose is `'suspense'`; the type
+ *      stays `'clearing'`, which is also what lets the account sit either side of zero
+ *      (ledger's overdraft trigger exempts type `clearing`).
+ *   3. the entry kind `'foresight.settlement_fee'` was not in the ledger's closed
+ *      `journal_entries_kind_chk` list (ledger/src/migrations.ts:181) — the vocabulary is closed
+ *      precisely so revenue reports can count on it, and the right name in it is `'fee_charged'`.
+ * No entry had ever posted (there is no public network yet), so nothing needed reconciling.
  */
 export function feePostings(input: {
   readonly amountWei: bigint
@@ -89,8 +104,8 @@ export function feePostings(input: {
       account: {
         subject: `chain:${input.chain}`,
         assetCode: 'EMBER',
-        purpose: 'clearing',
-        type: 'asset',
+        purpose: 'suspense',
+        type: 'clearing',
       },
       direction: 'debit',
       amount: input.amountWei,
