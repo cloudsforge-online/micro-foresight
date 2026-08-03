@@ -34,9 +34,17 @@
  */
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
-/** The scope this service's token must hold to read the policy. Exact-matched by admin-api. */
-export const ADMIN_API_SCOPES: readonly string[] = Object.freeze(['admin:read'])
+/**
+ * The scope this service's token must hold to read the policy. Exact-matched by admin-api.
+ *
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `policyclient.ts`.
+ * This is an outbound demand, `derive-grants.mjs` reads it into the estate's grant list, and
+ * identity refuses to boot on a name the registry does not have — or has deprecated, which
+ * `Scope` alone would not have caught.
+ */
+export const ADMIN_API_SCOPES: readonly LiveScope[] = Object.freeze(['admin:read'])
 
 /** Foresight's seed caps as admin-api's policy states them, in wei per outcome side. */
 export interface SeedPolicy {

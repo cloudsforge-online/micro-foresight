@@ -47,14 +47,21 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { ChainFamily, Network } from '@cloudsforge/contracts-chain'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry, and they are TWO.
  *
  * Not `custody:sign:treasury` and not `custody:sign:deposit`: foresight never moves money, so a
  * credential that could is a credential whose compromise is a loss rather than an outage. SD-05.
+ *
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `policyclient.ts`.
+ * This is an outbound demand, `derive-grants.mjs` reads it into the estate's grant list, and
+ * identity
+ * refuses to boot on a name the registry does not have — or has deprecated, which `Scope` alone
+ * would not have caught.
  */
-export const CUSTODY_SCOPES: readonly string[] = Object.freeze([
+export const CUSTODY_SCOPES: readonly LiveScope[] = Object.freeze([
   'custody:sign:deployer',
   'custody:address:create',
 ])
