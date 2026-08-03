@@ -7,7 +7,7 @@ proposes questions with cited sources and an operator approves or discards them;
 is a deployed contract taking stakes until close; resolution is posted on-chain after a dispute
 window, and winners are paid from the pool by the contract, not by anybody's database.
 
-Design authority: `docs/ecosystem/19-new-products.md` §2.
+Design authority: [`ecosystem/19-new-products.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/19-new-products.md) §2.
 
 ---
 
@@ -406,3 +406,10 @@ this repository's own:
 
 Nothing needed reconciling — there is no public network yet, so no entry had ever posted. The
 test asserting the old kind was asserting the defect, and was corrected with it.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
