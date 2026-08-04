@@ -206,9 +206,32 @@ governs the platform's own front door, which is the route essentially every user
 ## Architecture
 
 - **No `setInterval`.** The idea pipeline, close, resolution, mirror sync and fee reporting are
-  leased jobs claimed `FOR UPDATE SKIP LOCKED` via `@cloudsforge/jobs`. Recurrence is a job that
-  re-enqueues itself. Two workers are safe, and `jobs.test.ts` proves it with two real runners
-  against one real Postgres.
+  leased jobs claimed `FOR UPDATE SKIP LOCKED` via `@cloudsforge/jobs`. Two workers are safe, and
+  `jobs.test.ts` proves it with two real runners against one real Postgres.
+- **Recurrence is a boot seed plus a re-arm on the runner's `completed` event — never a handler
+  enqueuing itself.** This line used to read "recurrence is a job that re-enqueues itself", and that
+  is what the code did, and it did not work: `enqueue` is `on conflict (kind, key) do nothing`, so a
+  self-enqueue landed on the handler's own still-present row, and `JobRunner` then deleted that row
+  with `complete()`. Every background job in this service therefore ran **exactly once per boot and
+  then never again**, silently — an empty `jobs` table is indistinguishable from a service with
+  nothing to do. Found by running it: the table held 0 rows 47 minutes into a live deployment while
+  nine sibling services held live ones, and the outbox showed every event's `published_at` landing at
+  the timestamp of the *next container boot*. `recurringJobs` in `jobs.ts` is the table,
+  `rescheduleRecurring` is the re-arm, and `foresight_jobs_recurring_present` vs
+  `…_expected` makes a recurrence that stops visible in one scrape.
+- **The two kinds keyed on a market id — `market.deploy` and `mirror.sync` — are driven by sweeps**
+  (`deploy.sweep`, `mirror.sweep`), because a fixed re-arm table cannot hold a key that only exists
+  once an operator approves something. `deploySweepHandler` had been written and tested for this and
+  was never passed to `runner.register`; it is registered now, and a test asserts every declared kind
+  has a handler.
+- **Service tokens are exchanged, not read once.** `FORESIGHT_IDENTITY_CREDENTIAL` is a long-lived
+  `cfsc_…` secret exchanged at `POST /service-tokens/exchange` by `@cloudsforge/auth`'s
+  `ServiceTokenProvider`, wired in `src/upstreams.ts`. The old `FORESIGHT_SERVICE_TOKEN` is a
+  600-second JWT nothing could renew, and this service's custody calls come from leased jobs — the
+  exact shape that froze EMBER reconciliation through `micro-ledger`. It is still accepted, as a
+  migration aid, and the boot log says `fatal` when it is all there is. `servicetoken.test.ts` drives
+  a real leased job **eleven minutes and then eight hours** past the token's life and asserts it cost
+  no 401 at all — a run at minute zero proves nothing here.
 - **The lease key names the contended resource.** `market.deploy` is keyed on the market (each has
   its own custody-minted deployer, so they are genuinely parallel); `resolution.post` is keyed on
   `oracle:<chain>:<network>` (every market on a chain resolves through ONE oracle address, so the

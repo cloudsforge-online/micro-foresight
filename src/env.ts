@@ -78,6 +78,22 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
   return value
 }
 
+/**
+ * A secret that may be absent, but which must be a real one when present.
+ *
+ * `null` rather than `undefined`, so "this deployment has none" is a value a caller must handle
+ * rather than a property it can forget to read. The placeholder and length checks are `requiredSecret`'s
+ * verbatim: an optional secret that is present is exactly as dangerous as a mandatory one when it is
+ * the string `placeholder`, and the estate's compose files default several of these to
+ * `estate-placeholder-token-0000000000000000` — long enough to pass a length check, which is why the
+ * placeholder list matters more here than the length does.
+ */
+function optionalSecret(source: Source, name: string): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  return requiredSecret(source, name)
+}
+
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
   return value && value.length > 0 ? value : fallback
@@ -182,12 +198,67 @@ export interface Env {
    */
   readonly instanceId: string
 
+  /**
+   * Where a service token is minted. `IDENTITY_ISSUER` unless overridden.
+   *
+   * Defaulted to the issuer rather than made a separate required variable, because the issuer of a
+   * token is by definition where the token came from — ledger's reasoning (`ledger/src/env.ts:172`),
+   * and it means this fix needs no new URL in any deploy manifest.
+   */
+  readonly identityUrl: string
+
+  /**
+   * The long-lived `cfsc_…` credential this service exchanges for a service token.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE TEN-MINUTE CLIFF, AND WHY IT BIT THIS SERVICE HARDER THAN MOST.**
+   *
+   * `FORESIGHT_SERVICE_TOKEN` holds a token that lives **600 seconds** (`identity/src/tokens.ts:28`)
+   * and `index.ts` read it once, at import: `const token = () => env.serviceToken`, handed verbatim
+   * to all five `HttpClient`s. So this service authenticated to custody, the indexer, the ledger,
+   * policy and admin-api **exactly once per bootstrap** and never again.
+   *
+   * tessera and emberkin share the shape and mostly get away with it, because their upstream calls
+   * happen on request paths that a bootstrap outruns. **This service's custody calls come from
+   * LEASED BACKGROUND JOBS** — `market.deploy` and `resolution.post` — which is precisely the shape
+   * that froze EMBER reconciliation for hours through `micro-ledger`: a 600-second token behind a
+   * longer timer authenticates at boot and never again, and the resulting 401 is indistinguishable
+   * from the dependency being down. A market approved eleven minutes after a bootstrap would sit in
+   * `awaiting_funds` forever with nothing in any log naming the cause.
+   *
+   * The fix is `micro-ledger`'s, unchanged: `@cloudsforge/auth`'s `ServiceTokenProvider` exchanges
+   * this credential at `POST /service-tokens/exchange`, caches, re-mints at ~80% of `expiresIn` with
+   * per-token jitter, shares one in-flight exchange, and on a 401 discards exactly the rejected
+   * token and replays once. `src/upstreams.ts` carries the argument; this field is the input.
+   *
+   * **Not `requiredSecret`, for ledger's reason and one of our own.** `migrator.ts` shares this
+   * environment and `foresight-migrate` is given no credential — it dials nothing. And the estate's
+   * deploy does not set this variable yet (it sets the token), so making it mandatory would refuse
+   * to boot a service that is currently running. The absence is not silent: `index.ts` says so at
+   * boot at `fatal`, and `foresight_service_token_usable` is 0 on every scrape.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly identityCredential: string | null
+
   readonly custodyUrl: string
   readonly indexerUrl: string
   readonly ledgerUrl: string
   readonly policyUrl: string
-  /** The scoped service credential. Not shared: SD-05. */
-  readonly serviceToken: string
+  /**
+   * A pre-minted service token, kept ONLY as the bridge while the deploy still supplies one.
+   *
+   * **This is the defective credential, and it is optional now rather than required.** It expires in
+   * 600 seconds and nothing can renew it, so a deployment holding only this is a deployment whose
+   * background jobs stop authenticating ten minutes after boot. `upstreams.ts` prefers the
+   * credential whenever one is present and ignores this entirely; when it is not, this is presented
+   * and the boot log says, at `fatal`, exactly what will break and when.
+   *
+   * It exists at all because removing it would take the running estate's foresight offline the
+   * moment this ships — `micro-deploy` sets `FORESIGHT_SERVICE_TOKEN` and does not yet pass
+   * `FORESIGHT_IDENTITY_CREDENTIAL`, which its bootstrap already mints. **Delete this field once
+   * the deploy passes the credential**; it is a migration aid with a stated end, not a mode.
+   */
+  readonly serviceToken: string | null
   readonly upstreamDeadlineMs: number
 
   /**
@@ -326,11 +397,14 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
+    identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
+    identityCredential: optionalSecret(source, 'FORESIGHT_IDENTITY_CREDENTIAL'),
+
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
     policyUrl: required(source, 'POLICY_URL'),
-    serviceToken: requiredSecret(source, 'FORESIGHT_SERVICE_TOKEN'),
+    serviceToken: optionalSecret(source, 'FORESIGHT_SERVICE_TOKEN'),
     upstreamDeadlineMs: integer(source, 'FORESIGHT_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
 
     rpcUrls: jsonMap(source, 'FORESIGHT_RPC_URLS', '{}'),

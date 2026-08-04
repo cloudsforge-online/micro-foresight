@@ -28,13 +28,9 @@ import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { CATEGORY_VERSION } from './categories.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
-import { registerHandlers, seedRecurring, type JobDeps } from './jobs.ts'
+import { recurringJobs, registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
 import { createRelay } from './outbox.ts'
-import { httpAdminApiClient } from './adminapiclient.ts'
-import { httpCustodyClient } from './custodyclient.ts'
-import { httpIndexerClient } from './indexerclient.ts'
-import { httpLedgerClient } from './ledgerclient.ts'
-import { httpPolicyClient } from './policyclient.ts'
+import { buildUpstreams } from './upstreams.ts'
 import { createProposer } from './proposer.ts'
 import { rpcRouter, type DeployDeps } from './deploy.ts'
 import { httpSourceProbe, type ResolveDeps } from './resolve.ts'
@@ -97,30 +93,65 @@ try {
 }
 
 // 5. The upstreams. Constructed before the Lifecycle so its probes can close over their URLs, and
-//    all four take the same scoped service token — never a shared one (SD-05).
-const token = () => env.serviceToken
-const custody = httpCustodyClient({
-  baseUrl: env.custodyUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const indexer = httpIndexerClient({
-  baseUrl: env.indexerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const ledger = httpLedgerClient({
-  baseUrl: env.ledgerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
+//    all five take the same scoped service credential — never a shared one (SD-05).
+//
+//    ══════════════════════════════════════════════════════════════════════════════════════════
+//    **THE CREDENTIAL IS EXCHANGED, NOT READ ONCE.** The line that used to be here was
+//
+//        const token = () => env.serviceToken
+//
+//    — a function called per request, returning a string read once at import from a token that
+//    expires in 600 seconds. This service's custody calls come from LEASED JOBS that run every
+//    fifteen seconds for ever, so it authenticated once per bootstrap and then presented a dead
+//    token to custody, the indexer, the ledger, policy and admin-api for the rest of the process's
+//    life — and the 401 that came back was recorded as custody refusing us or custody being down,
+//    which sends an operator to the wrong service entirely.
+//
+//    The seam was right and the body was wrong, which is why the body now lives in `upstreams.ts` —
+//    a module a test can import without starting a server, and the only way to write a test that
+//    fails when THIS FILE regresses. That file carries the argument, including why the credential
+//    is deliberately NOT wired to a hard readiness probe here.
+//    ══════════════════════════════════════════════════════════════════════════════════════════
+const upstreams = buildUpstreams(env, {
   originatingService: SERVICE,
+  onEvent: (event) => {
+    metrics.increment('foresight_service_token_events_total', { kind: event.kind })
+    if (event.kind === 'minted') {
+      logger.info('minted a service token from the credential', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else if (event.kind === 'exchange_failed') {
+      // `warn`, not `fatal`, and only because of `hadUsableToken`: a failed exchange while a live
+      // token is still held is the outage this provider is built to ride out, and paging on it
+      // would page on every identity blip.
+      logger.warn('service credential exchange failed', { ...event })
+    }
+  },
 })
-const policy = httpPolicyClient({
-  baseUrl: env.policyUrl,
-  token,
-  deadlineMs: env.policyDeadlineMs,
-  action: env.policyAction,
-})
+const { custody, indexer, ledger, policy } = upstreams
+
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+// Said at boot, at the level its consequence deserves, because the alternative is discovering it as
+// a 401 nine minutes later that names the wrong service.
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+if (upstreams.mode === 'none') {
+  logger.fatal('NO CREDENTIAL AT ALL — every deploy, resolution, fee report and stake intent will fail', {
+    remedy: 'set FORESIGHT_IDENTITY_CREDENTIAL (long-lived, cfsc_…, from POST /service-credentials)',
+  })
+} else if (upstreams.mode === 'static') {
+  logger.fatal('EXPIRING TOKEN, NOT A CREDENTIAL — every upstream call will 401 about ten minutes from now', {
+    // Said out loud so the failure an operator will hit is one they can search for.
+    whatWillHappen:
+      'FORESIGHT_SERVICE_TOKEN lives 600s and nothing can renew it. market.deploy and resolution.post ' +
+      'run every 15s from a leased job, so from minute ten custody refuses every signature and the log ' +
+      'will say custody refused or custody was unavailable, which is NOT the cause.',
+    remedy:
+      'set FORESIGHT_IDENTITY_CREDENTIAL in the deploy; estate-bootstrap.sh section 5b already mints it',
+  })
+}
+
 const rpc = rpcRouter(env.rpcUrls, env.rpcDeadlineMs)
 
 // 6. Lifecycle and its probes.
@@ -173,6 +204,11 @@ const queue = new JobQueue(sql as unknown as JobsSql, {
   // ceiling on a STEP rather than on the job.
   leaseMs: 120_000,
 })
+
+// What the recurring schedule is computed from. Declared here, before the routes, because
+// `beforeScrape` reads it and because `rescheduleRecurring` and `seedRecurring` below must be given
+// the SAME values — a re-arm keyed on a different chain than the seed would arm a row nothing runs.
+const schedule = { chain: CHAIN, network: env.network, proposeEveryMinutes: env.proposeEveryMinutes }
 
 const bounds = { minGasPriceWei: env.minGasPriceWei, maxGasPriceWei: env.maxGasPriceWei }
 
@@ -240,15 +276,53 @@ const server = createServer({
   // The house seed — 21 §5. Both may be absent, and absent means "no engagement programme
   // here": approving with a seed refuses with a sentence rather than degrading into one.
   houseAddress: env.houseAddress,
-  engagementPolicies: env.adminApiUrl
-    ? httpAdminApiClient({ baseUrl: env.adminApiUrl, token, deadlineMs: env.upstreamDeadlineMs })
-    : null,
+  engagementPolicies: upstreams.engagementPolicies,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {
     const stats = await queue.stats()
     metrics.set('jobs_pending', stats.pending)
     metrics.set('jobs_overdue', stats.overdue)
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    // **HOW MANY OF THE RECURRING JOBS ACTUALLY EXIST RIGHT NOW.**
+    //
+    // The series exists because of how this service's schedule died: every handler re-enqueued its
+    // own `(kind, key)` and the runner deleted that row a moment later, so `jobs` was EMPTY ten
+    // minutes after every boot and every background thing — market lifecycle, the idea pipeline,
+    // resolution, fee settlement — had silently stopped. Nothing alerted, because `jobs_pending: 0`
+    // is exactly what a healthy idle queue looks like.
+    //
+    // It is not. This service has a fee report due every minute and a relay due every second, so
+    // fewer than `recurringJobs().length` rows present is a schedule that has stopped, and it is
+    // detectable in one scrape rather than by noticing an absence. Counted against the same table
+    // `recurringJobs` builds, so a job added there is covered without touching this line.
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    const expected = recurringJobs(schedule)
+    const present = await sql<{ n: number }[]>`
+      select count(*)::int as n
+        from jobs j
+        join unnest(${expected.map((job) => job.kind)}::text[], ${expected.map((job) => job.key)}::text[])
+          as wanted(kind, key)
+          on wanted.kind = j.kind and wanted.key = j.key
+    `
+    metrics.set('foresight_jobs_recurring_present', present[0]?.n ?? 0)
+    metrics.set('foresight_jobs_recurring_expected', expected.length)
+
+    // Read out of the provider's own memory. `static` counts as usable because it is — for about
+    // ten minutes — which is exactly why it needs the second gauge beside it rather than a kinder
+    // reading of the first.
+    metrics.set(
+      'foresight_service_token_usable',
+      upstreams.mode === 'exchanged'
+        ? (upstreams.identityTokens?.snapshot().hasUsableToken ?? false)
+          ? 1
+          : 0
+        : upstreams.mode === 'static'
+          ? 1
+          : 0,
+    )
+    metrics.set('foresight_service_token_static', upstreams.mode === 'static' ? 1 : 0)
   },
 })
 
@@ -272,6 +346,25 @@ const jobDeps: JobDeps = {
   ledger,
 }
 
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+// **THE RE-ARM, AND WHY IT IS HERE RATHER THAN IN THE HANDLERS.**
+//
+// Every recurring handler in `jobs.ts` used to end by enqueuing its own `(kind, key)`. `enqueue` is
+// `on conflict (kind, key) do nothing`, and the row it conflicted with was the handler's own — still
+// present, still claimed. `JobRunner` then called `queue.complete(job.id)`, which is
+// `delete from jobs where id = $1`. The row the reschedule "made" and the row the delete removed
+// were the same row, so this service's entire schedule stopped at the first completion after every
+// boot: `jobs` was observed EMPTY 47 minutes into a live run while nine sibling services had rows,
+// and the outbox showed it plainly — each event's `published_at` was the timestamp of the NEXT
+// container boot, because the relay only ever ran once, at start.
+//
+// `completed` is emitted after `complete()` has resolved, so it is the first moment the row is
+// provably gone and an enqueue can insert rather than conflict. `ledger/src/jobs.ts:132-137` names
+// this trap and this is its fix, unchanged; six services already do it this way and there is no
+// reason for a seventh pattern.
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+const reschedule = rescheduleRecurring(queue, logger, schedule)
+
 const runner = new JobRunner({
   queue,
   concurrency: 4,
@@ -290,6 +383,7 @@ const runner = new JobRunner({
     if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
       logger.error('job failure', { ...event })
     }
+    reschedule(event)
   },
 })
 
@@ -302,7 +396,7 @@ registerHandlers(
   }),
   (kind, handler) => runner.register(kind, handler),
 )
-await seedRecurring(queue, CHAIN, env.network)
+await seedRecurring(queue, schedule)
 runner.start()
 
 // 10. Listen. Last of the construction steps, because a socket that accepts before its dependencies

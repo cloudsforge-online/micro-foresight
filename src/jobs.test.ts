@@ -19,11 +19,13 @@ import assert from 'node:assert/strict'
 import type postgres from 'postgres'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import {
+  DEPLOY_SWEEP,
   FEE_REPORT,
   IDEA_PROPOSE,
   JOB_KINDS,
   MARKET_CLOSE,
   MARKET_DEPLOY,
+  MIRROR_SWEEP,
   MIRROR_SYNC,
   OUTBOX_RELAY,
   PROPOSAL_TOPICS,
@@ -33,9 +35,15 @@ import {
   feeReportHandler,
   ideaProposeHandler,
   marketCloseHandler,
+  mirrorSweepHandler,
+  recurringJobs,
+  registerHandlers,
+  rescheduleRecurring,
   seedRecurring,
   type JobDeps,
+  type ScheduleDeps,
 } from './jobs.ts'
+import { createRelay } from './outbox.ts'
 import { CATEGORY_VERSION } from './categories.ts'
 import { findMarket } from './markets.ts'
 import { ACTION_VOID } from './resolve.ts'
@@ -158,29 +166,145 @@ test('THE PROPERTY: two workers, one due idea job, exactly one run', { skip }, a
   assert.equal(ideas[0]?.n, PROPOSAL_TOPICS.length, 'the pipeline ran more than once')
 })
 
-test('a recurring job re-enqueues itself rather than living on a timer', { skip }, async () => {
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE RECURRENCE, AND THE ONLY WAY TO TEST IT THAT IS NOT ITSELF THE DEFECT.
+ *
+ * The test that used to stand here was:
+ *
+ *     await handler(job, ctx)                                  // call the handler directly
+ *     assert.equal(rowsFor(IDEA_PROPOSE).length, 1)            // it enqueued a follow-up
+ *
+ * and it was **green against code whose schedule was completely dead.** Every handler really did
+ * enqueue its own `(kind, key)`; the enqueue was not the broken part. `JobRunner` then called
+ * `queue.complete(job.id)` — `delete from jobs where id = $1` — and because `enqueue` is
+ * `on conflict (kind, key) do nothing`, the row the handler "created" was the very row it was
+ * running as. Delete one, lose both. The old test never ran a runner, so `complete()` never fired
+ * and the row it looked at was one the real system removes a millisecond later.
+ *
+ * Live consequence, before this change: foresight's `jobs` table held **0 rows 47 minutes after
+ * start** while nine sibling services held live ones, and its `outbox` proved the mechanism — every
+ * event's `published_at` was the timestamp of the NEXT container boot, because `outbox.relay` only
+ * ever ran once, at start.
+ *
+ * So the two tests below drive a **real `JobRunner` through a whole claim → run → complete cycle**
+ * and then look for the row. `BASELINE` models the old seam against the same fixtures, in the same
+ * file, and shows it losing the row — which is what makes the first test a check on this fix rather
+ * than a restatement of it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+const SCHEDULE: ScheduleDeps = { chain: 'ember', network: 'testnet', proposeEveryMinutes: 360 }
+
+/** The composition root's wiring, minus the socket: handlers registered, re-arm on `completed`. */
+function wiredRunner(queue: JobQueue, deps: JobDeps): JobRunner {
+  const reschedule = rescheduleRecurring(queue, quietLogger(), SCHEDULE)
+  const runner = new JobRunner({ queue, concurrency: 4, pollMs: 10, onEvent: reschedule })
+  registerHandlers(
+    deps,
+    createRelay({ sql: db(sql), logger: quietLogger(), signingSecret: 'test-signing-secret' }),
+    (kind, handler) => runner.register(kind, handler),
+  )
+  return runner
+}
+
+test('THE PROPERTY: a recurring row SURVIVES its own completion', { skip }, async () => {
   const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
-  const handler = ideaProposeHandler(depsFor(queue))
-  await handler({ id: 'x', kind: IDEA_PROPOSE, key: 'global', attempts: 1, maxAttempts: 5, payload: {} }, {
-    heartbeat: async () => true,
-    signal: new AbortController().signal,
-  })
-  const rows = await sql<{ kind: string; run_at: Date }[]>`select kind, run_at from jobs where kind = ${IDEA_PROPOSE}`
-  assert.equal(rows.length, 1)
-  assert.ok((rows[0]?.run_at.getTime() ?? 0) > Date.now(), 'the next run was not scheduled in the future')
+  const runner = wiredRunner(queue, depsFor(queue))
+
+  await seedRecurring(queue, SCHEDULE)
+  const expected = recurringJobs(SCHEDULE)
+  assert.equal(
+    (await sql<{ n: number }[]>`select count(*)::int as n from jobs`)[0]?.n,
+    expected.length,
+    'the boot seed did not produce one row per recurring job',
+  )
+
+  // Run every seeded job to completion. Concurrency is 4 and there are more kinds than that, so
+  // this ticks until nothing is due rather than assuming one tick drains the set.
+  let claimed = 0
+  for (let i = 0; i < 10; i += 1) claimed += await runner.tick()
+  assert.ok(claimed >= expected.length, `only ${claimed} of ${expected.length} recurring jobs ran`)
+
+  // ── THE ASSERTION THE OLD TEST COULD NOT MAKE ────────────────────────────────────────────────
+  // Not "an enqueue happened" — it happened before too. The row is STILL HERE, after the runner
+  // deleted the one it ran, and it is scheduled for the future. Revert `index.ts`/`jobs.ts` to the
+  // self-enqueue seam and every one of these rows is gone.
+  const rows = await sql<{ kind: string; key: string; run_at: Date }[]>`
+    select kind, key, run_at from jobs order by kind
+  `
+  assert.deepEqual(
+    rows.map((row) => `${row.kind}|${row.key}`).sort(),
+    expected.map((job) => `${job.kind}|${job.key}`).sort(),
+    'a recurring job did not survive its own completion',
+  )
+  for (const row of rows) {
+    const job = expected.find((candidate) => candidate.kind === row.kind && candidate.key === row.key)
+    assert.ok(job, `${row.kind} is not a recurring job`)
+    assert.ok(
+      row.run_at.getTime() > Date.now(),
+      `${row.kind} was re-armed in the past (${row.run_at.toISOString()}) — it would spin, not wait`,
+    )
+    // Armed at its OWN interval, not at somebody else's. A single shared cadence would put the
+    // relay on six minutes or the idea pipeline on one second, and both are wrong.
+    assert.ok(
+      row.run_at.getTime() <= Date.now() + job.everyMs + 5_000,
+      `${row.kind} was re-armed far past its ${job.everyMs}ms interval`,
+    )
+  }
+
+  // And a SECOND cycle, because "survives once" is not "recurs". The old code survived zero.
+  await sql`update jobs set run_at = now()`
+  let second = 0
+  for (let i = 0; i < 10; i += 1) second += await runner.tick()
+  assert.ok(second >= expected.length, 'the schedule did not survive a second pass')
+  assert.equal(
+    (await sql<{ n: number }[]>`select count(*)::int as n from jobs`)[0]?.n,
+    expected.length,
+    'the recurring set did not survive a second completion',
+  )
 })
 
-test('an unconfigured proposer completes the run and schedules the next one', { skip }, async () => {
+test('BASELINE: the seam this replaced loses the row, driven the same way', { skip }, async () => {
+  const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
+
+  // The old shape, exactly: the handler enqueues its own (kind, key) and nothing listens to
+  // `completed`. This is `ideaProposeHandler`'s old `finally` block, reduced to the one line that
+  // mattered.
+  const runner = new JobRunner({ queue, concurrency: 1, pollMs: 10 })
+  runner.register(IDEA_PROPOSE, async () => {
+    await queue.enqueue({
+      kind: IDEA_PROPOSE,
+      key: 'global',
+      runAt: new Date(Date.now() + 360 * 60_000),
+      onConflict: 'keep',
+    })
+  })
+
+  await queue.enqueue({ kind: IDEA_PROPOSE, key: 'global' })
+  assert.equal(await runner.tick(), 1, 'the baseline job did not run')
+
+  // The re-enqueue DID happen — that is why a handler-only test was green — and the row is gone
+  // anyway, because `complete()` deleted the row the enqueue had conflicted onto.
+  assert.equal(
+    (await sql`select 1 from jobs where kind = ${IDEA_PROPOSE}`).length,
+    0,
+    'the baseline kept its row; the defect this file exists for is not being modelled',
+  )
+})
+
+test('an unconfigured proposer completes the run rather than throwing', { skip }, async () => {
   const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
   // Not a throw, not a dead letter, and not an error line every six hours for a thing nobody has
-  // set up. `micro-notify`'s SMTP discipline.
+  // set up. `micro-notify`'s SMTP discipline. The NEXT run is armed by the runner's `completed`
+  // event, not by this handler — see THE PROPERTY above.
   const handler = ideaProposeHandler(depsFor(queue))
   await handler({ id: 'x', kind: IDEA_PROPOSE, key: 'global', attempts: 1, maxAttempts: 5, payload: {} }, {
     heartbeat: async () => true,
     signal: new AbortController().signal,
   })
   assert.equal((await sql`select 1 from ideas`).length, 0)
-  assert.equal((await sql`select 1 from jobs where kind = ${IDEA_PROPOSE}`).length, 1)
+  // And it wrote NOTHING to the queue. A handler that still self-enqueued would leave a row here,
+  // and that row is the one `complete()` eats.
+  assert.equal((await sql`select 1 from jobs`).length, 0, 'the handler enqueued its own next run')
 })
 
 test('a proposal that fails validation is dropped and counted, never repaired', { skip }, async () => {
@@ -219,7 +343,7 @@ test('a proposal that fails validation is dropped and counted, never repaired', 
 
 /* ------------------------------------------------------------------ closing */
 
-test('the close job closes only what is due, and re-enqueues itself', { skip }, async () => {
+test('the close job closes only what is due', { skip }, async () => {
   const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
   const due = await seedDraft(sql, { closeTime: new Date(Date.now() + 60_000) })
   const notDue = await seedDraft(sql, { closeTime: new Date(Date.now() + 10 * 60_000) })
@@ -238,7 +362,9 @@ test('the close job closes only what is due, and re-enqueues itself', { skip }, 
   // One event, on the public topic.
   const events = await sql<{ topic: string }[]>`select topic from outbox`
   assert.deepEqual(events.map((row) => row.topic), ['foresight.market.closed'])
-  assert.equal((await sql`select 1 from jobs where kind = ${MARKET_CLOSE}`).length, 1)
+  // No self-enqueue: the next scan is armed off the runner's `completed` event, because a row this
+  // handler wrote would be the row `complete()` deletes.
+  assert.equal((await sql`select 1 from jobs`).length, 0)
 })
 
 /* ------------------------------------------------------------------ the sweep */
@@ -344,11 +470,13 @@ test('a confirmed void becomes a voided market with the rationale as the reason'
 test('every job kind has a documented lease key, and the recurring ones are seeded once', { skip }, async () => {
   const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
   assert.deepEqual([...JOB_KINDS].sort(), [
+    DEPLOY_SWEEP,
     FEE_REPORT,
     IDEA_PROPOSE,
     MARKET_CLOSE,
-    MARKET_DEPLOY,
+    MIRROR_SWEEP,
     MIRROR_SYNC,
+    MARKET_DEPLOY,
     OUTBOX_RELAY,
     RESOLUTION_POST,
   ].sort())
@@ -356,21 +484,79 @@ test('every job kind has a documented lease key, and the recurring ones are seed
   // N replicas booting together produce ONE pending run of each, because `(kind, key)` is unique
   // and `onConflict: 'keep'` collapses the rest.
   await Promise.all([
-    seedRecurring(queue, 'ember', 'testnet'),
-    seedRecurring(queue, 'ember', 'testnet'),
-    seedRecurring(queue, 'ember', 'testnet'),
+    seedRecurring(queue, SCHEDULE),
+    seedRecurring(queue, SCHEDULE),
+    seedRecurring(queue, SCHEDULE),
   ])
   const rows = await sql<{ kind: string; key: string }[]>`select kind, key from jobs order by kind`
-  assert.equal(rows.length, 5)
   assert.deepEqual(
     rows.map((row) => `${row.kind}:${row.key}`).sort(),
     [
+      `${DEPLOY_SWEEP}:global`,
       `${FEE_REPORT}:global`,
       `${IDEA_PROPOSE}:global`,
       `${MARKET_CLOSE}:global`,
+      `${MIRROR_SWEEP}:global`,
       `${OUTBOX_RELAY}:global`,
       // The one that is NOT global: the oracle's nonce is contended per chain.
       `${RESOLUTION_POST}:oracle:ember:testnet`,
     ].sort(),
   )
+})
+
+test('THE GAP THAT WAS THERE: every declared kind is actually registered', { skip }, async () => {
+  // `deploySweepHandler` was written, documented as the thing that "catches a row nothing
+  // re-enqueued", covered by a test in this very file — and never passed to `runner.register`. So
+  // the safety net beneath the annihilated self-enqueue was not in the process at all, and an
+  // approved market could sit in `pending` until somebody restarted the container. Nothing could
+  // have noticed: an unregistered kind is simply never claimed, because `JobRunner.tick` claims
+  // `[...this.#handlers.keys()]` and an absent key is an absent filter entry, not an error.
+  const registered = new Set<string>()
+  registerHandlers(
+    depsFor(new JobQueue(sql as unknown as JobsSql, { owner: 'w' })),
+    async () => {},
+    (kind) => {
+      assert.ok(!registered.has(kind), `${kind} was registered twice`)
+      registered.add(kind)
+    },
+  )
+  assert.deepEqual([...registered].sort(), [...JOB_KINDS].sort(), 'a declared kind has no handler')
+})
+
+test('every recurring kind is a declared kind, armed at a positive interval', { skip }, async () => {
+  // A recurring row whose kind nothing handles is a row that is claimed by nobody and sits in the
+  // table for ever, dragging `jobs_overdue` up and reporting a fault that does not exist.
+  for (const job of recurringJobs(SCHEDULE)) {
+    assert.ok(JOB_KINDS.includes(job.kind), `${job.kind} recurs but is not a declared kind`)
+    assert.ok(job.everyMs > 0, `${job.kind} recurs every ${job.everyMs}ms, which is a busy loop`)
+  }
+})
+
+test('the mirror sweep follows what has a contract and a life left, and nothing else', { skip }, async () => {
+  const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
+  const open = await seedDraft(sql)
+  const settled = await seedDraft(sql)
+  const undeployed = await seedDraft(sql)
+  await openDirect(sql, open.id)
+  await openDirect(sql, settled.id)
+  // `outcome` is not decoration here: `markets_resolved_has_outcome` refuses a settled market
+  // without one, which is the schema saying that "settled" is a claim about a decided question.
+  await sql`
+    update markets set status = 'settled', outcome = 0,
+           closed_at = now(), resolved_at = now(), settled_at = now()
+     where id = ${settled.id}
+  `
+
+  const handler = mirrorSweepHandler(depsFor(queue))
+  await handler({ id: 'x', kind: MIRROR_SWEEP, key: 'global', attempts: 1, maxAttempts: 5, payload: {} }, {
+    heartbeat: async () => true,
+    signal: new AbortController().signal,
+  })
+
+  const queued = await sql<{ key: string }[]>`select key from jobs where kind = ${MIRROR_SYNC}`
+  // `settled` is terminal — nothing further is ever staked against it, so following it for ever is
+  // an indexer call every 30 seconds for a number that can no longer change. `undeployed` has no
+  // contract, and `syncMarket` reads nothing without one.
+  assert.deepEqual(queued.map((row) => row.key), [open.id])
+  assert.ok(!queued.some((row) => row.key === undeployed.id))
 })

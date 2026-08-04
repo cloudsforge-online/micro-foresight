@@ -237,6 +237,28 @@ function maxBlock(stakes: readonly DecodedStake[]): number {
 }
 
 /** Record that a sync failed, so `/readyz` and the public page can say the mirror is behind. */
+/**
+ * Every market the mirror still has a reason to follow.
+ *
+ * A contract address, because `syncMarket` reads nothing without one, and a status that has not
+ * finished — `settled` and `void` are terminal and nothing further is ever staked against them, so
+ * following them for ever would be an indexer call per market per 30 seconds for a number that can
+ * no longer change. `resolved` IS followed: the settlement fee is paid on chain after resolution and
+ * `fee.report` needs the `FeePaid` log the mirror indexes.
+ *
+ * This is `mirror.sweep`'s queue. Before it existed, a market was mirrored exactly once — when its
+ * deploy reached `deployed` — and then relied on a self-enqueue that `JobRunner.complete` deleted.
+ */
+export async function listMirrorable(sql: Db, limit: number): Promise<readonly string[]> {
+  const rows = await sql<{ id: string }[]>`
+    select id from markets
+     where contract_address is not null
+       and status in ('open','closed','resolved')
+     order by updated_at limit ${limit}
+  `
+  return rows.map((row) => row.id)
+}
+
 export async function recordSyncError(sql: Db, marketId: string, message: string): Promise<void> {
   await sql`
     insert into mirror_cursors (market_id, last_error) values (${marketId}, ${message.slice(0, 2_000)})

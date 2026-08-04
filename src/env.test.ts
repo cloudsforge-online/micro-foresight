@@ -25,7 +25,8 @@ const MINIMAL: Readonly<Record<string, string>> = Object.freeze({
   INDEXER_URL: 'http://127.0.0.1:4008',
   LEDGER_URL: 'http://127.0.0.1:4007',
   POLICY_URL: 'http://127.0.0.1:4006',
-  FORESIGHT_SERVICE_TOKEN: 'a-real-looking-token-of-sufficient-length',
+  // NEITHER credential appears here, and that is the point of the block below: this service must
+  // boot without one, because `foresight-migrate` shares this environment and dials nothing.
   FORESIGHT_TREASURY_ADDRESS: '0x2222222222222222222222222222222222222222',
   FORESIGHT_ORACLE_ADDRESS: '0x1111111111111111111111111111111111111111',
   FORESIGHT_ORACLE_USER_ID: 'foresight',
@@ -53,6 +54,43 @@ test('the minimal configuration loads and defaults sensibly', () => {
   // a rounded bound does not hold at the value it was written for.
   assert.equal(typeof env.minGasPriceWei, 'bigint')
   assert.equal(env.deployGasLimit, 3_000_000n)
+})
+
+/* ------------------------------------------------------------------ the credential, and the cliff */
+
+test('BOTH credentials are optional, because the migrator shares this environment', () => {
+  // `FORESIGHT_SERVICE_TOKEN` used to be `requiredSecret`. It is now optional, and that is not a
+  // relaxation: it is the OLD, DEFECTIVE credential — a 600-second token nothing can renew — being
+  // demoted from mandatory to a migration aid while micro-deploy is taught to pass
+  // `FORESIGHT_IDENTITY_CREDENTIAL` instead. `upstreams.ts` carries the argument.
+  //
+  // `FORESIGHT_IDENTITY_CREDENTIAL` is optional for ledger's reason: `migrator.ts` imports this
+  // same module and `foresight-migrate` is given no credential because it calls nobody. Making it
+  // `requiredSecret` would refuse to run the migration that every deploy starts with.
+  const none = loadEnv(MINIMAL)
+  assert.equal(none.identityCredential, null)
+  assert.equal(none.serviceToken, null)
+
+  const exchanged = loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: 'cfsc_a-real-looking-credential-value' })
+  assert.equal(exchanged.identityCredential, 'cfsc_a-real-looking-credential-value')
+
+  // And `IDENTITY_URL` defaults to the issuer, so this fix needs no new URL in any deploy manifest:
+  // the issuer of a token is by definition where the token came from.
+  assert.equal(exchanged.identityUrl, MINIMAL['IDENTITY_ISSUER'])
+  assert.equal(loadEnv({ ...MINIMAL, IDENTITY_URL: 'http://identity:4000' }).identityUrl, 'http://identity:4000')
+})
+
+test('an optional secret that IS present is held to the same bar as a required one', () => {
+  // The dangerous middle state. Optional must not mean unchecked: the estate's compose defaults
+  // these to `estate-placeholder-token-0000000000000000`, which is 41 characters and sails through
+  // a length check — so the placeholder list matters more here than the length does.
+  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: 'short' }), /at least 24/)
+  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: 'placeholder' }), /known placeholder/)
+  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_SERVICE_TOKEN: 'placeholder' }), /known placeholder/)
+  // An empty string is ABSENT, not a bad secret: compose writes `VAR: ${VAR:-}` for an unset
+  // variable, so this is the shape a real deployment produces and it must not fail the boot.
+  assert.equal(loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: '' }).identityCredential, null)
+  assert.equal(loadEnv({ ...MINIMAL, FORESIGHT_SERVICE_TOKEN: '   ' }).serviceToken, null)
 })
 
 test('every required variable names itself when it is missing', () => {

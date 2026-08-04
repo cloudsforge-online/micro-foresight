@@ -207,6 +207,58 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['verdict'],
     })
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    // **THE TWO SERIES THAT WOULD HAVE CAUGHT THE SCHEDULE DYING.**
+    //
+    // Every recurring handler used to re-enqueue its own `(kind, key)`, which `JobRunner.complete`
+    // then deleted — so this service's `jobs` table was empty minutes after every boot and every
+    // background job had silently stopped. `jobs_pending: 0` could not report it: an empty queue is
+    // also what a healthy idle service looks like. These two can, because they are a comparison
+    // rather than a level. `present < expected` means a recurring job that must exist does not.
+    // Sampled in `index.ts`'s `beforeScrape` against the same `recurringJobs` table the seed uses.
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    .register({
+      name: 'foresight_jobs_recurring_present',
+      help: 'Recurring jobs currently in the table. Below `expected` means the schedule has stopped.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'foresight_jobs_recurring_expected',
+      help: 'How many recurring jobs this build defines. The denominator for the gauge above.',
+      kind: 'gauge',
+      labels: [],
+    })
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    // **WHETHER THIS PROCESS CAN AUTHENTICATE TO ITS PEERS RIGHT NOW.**
+    //
+    // The question that had no answer anywhere in the estate while a ten-minute token was quietly
+    // dying inside a fifteen-second leased job. Sampled from what the provider already holds rather
+    // than by dialling identity: a probe that dialled would multiply readiness traffic by the
+    // replica count into the one service it can least afford to amplify a fault in.
+    //
+    // 0 when there is no credential at all, so the series exists in that deployment too — an absent
+    // metric is indistinguishable from a scrape that failed, and this is the one condition that must
+    // not be silent.
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+    .register({
+      name: 'foresight_service_token_usable',
+      help: 'Can this process present a live service token? 0 means every upstream call will 401.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'foresight_service_token_static',
+      help: '1 when the credential is a pre-minted 600s token nothing can renew — the ten-minute cliff.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'foresight_service_token_events_total',
+      help: 'Service-token provider events by kind: minted, exchange_failed, reminted_after_401, replay_skipped.',
+      kind: 'counter',
+      labels: ['kind'],
+    })
 }
 
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/

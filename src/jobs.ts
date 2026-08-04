@@ -28,14 +28,58 @@
  *   |                   |                            | makes a duplicate a replay, but a second  |
  *   |                   |                            | worker is still wasted round trips.       |
  *   | outbox.relay      | global                     | Two relays deliver every event twice.     |
+ *   | deploy.sweep      | global                     | A scan. Two scanners enqueue the same set |
+ *   |                   |                            | twice for nothing.                        |
+ *   | mirror.sweep      | global                     | The same, for the mirror.                 |
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * **There is no `setInterval` in this repository.** Recurrence is a job that re-enqueues itself
  * with a future `runAt`, which is the only form that is correct with two replicas: a timer is a
  * variable in one process and is by construction invisible to the other.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ## AND A HANDLER MUST NOT RE-ENQUEUE ITSELF. IT DID, AND IT COST THIS SERVICE EVERY TIMER IT HAS.
+ *
+ * Until this change every recurring handler in this file ended with an enqueue of its own
+ * `(kind, key)` — `ideaProposeHandler`'s `finally`, `marketCloseHandler`'s tail, `mirrorSyncHandler`,
+ * `resolutionPostHandler`, and `marketDeployHandler`'s fast path. The header above even described
+ * that as the design. **All five were undone a moment later by the runner**, and the mechanism is
+ * three lines of `@cloudsforge/jobs`:
+ *
+ *   * `JobQueue.enqueue` is `insert … on conflict (kind, key) do nothing` (`jobs/src/index.ts:153`).
+ *     The row it conflicts with is the handler's OWN row, which is still there, claimed and locked.
+ *     So the self-enqueue never inserts anything — it updates, or ignores, the row already present.
+ *   * `JobRunner.#run` then calls `queue.complete(job.id)` (`jobs/src/index.ts:407`), and `complete`
+ *     is `delete from jobs where id = $1` (`:223`).
+ *   * The row the reschedule "created" and the row the delete removes **are the same row**.
+ *
+ * Net effect: every background thing this service does ran exactly once per boot and then never
+ * again, silently, because an empty `jobs` table looks like a service with nothing to do. Observed
+ * in the live estate: foresight's `jobs` table held **0 rows 47 minutes after start** while nine
+ * other services held live ones, and its `outbox` showed the signature — each event's `published_at`
+ * equals the timestamp of the NEXT CONTAINER BOOT, because `outbox.relay` only ever ran at boot.
+ *
+ * A test that asserts "the handler enqueued a follow-up" passes against that broken code, because
+ * the enqueue does happen. **The delete afterwards is the defect**, so the only test that can see it
+ * is one that drives a real `JobRunner` through a whole claim → run → complete cycle and then looks
+ * for the row. That is `jobs.test.ts`'s `THE PROPERTY: a recurring row SURVIVES its own completion`.
+ *
+ * `ledger/src/jobs.ts:132-137` names this trap and gives the fix, and it is the one used here rather
+ * than a third pattern: a recurring job is **a boot seed plus a re-arm driven by the runner's
+ * `completed` event**, which is the only point at which the row is provably gone. `recurringJobs`
+ * below is the table, `seedRecurring` is the seed, `rescheduleRecurring` is the re-arm.
+ *
+ * ## THE TWO KINDS WHOSE KEY IS NOT KNOWN AT BOOT
+ *
+ * `market.deploy` and `mirror.sync` are keyed on a market id, so they cannot appear in a fixed
+ * table — the key set changes every time an operator approves a market. They are driven instead by
+ * `deploy.sweep` and `mirror.sweep`, which ARE recurring, scan the database and enqueue one job per
+ * outstanding row. That is the same shape `micro-mint`'s `chain.sweep` has, and `deploySweepHandler`
+ * was already written and tested here for exactly this purpose — **and never registered**, which is
+ * why a broadcast deploy had no reconciler of any kind once its self-enqueue was eaten.
  */
 
-import { JobQueue, type Handler } from '@cloudsforge/jobs'
+import { JobQueue, type Handler, type RunnerEvent } from '@cloudsforge/jobs'
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { CATEGORY_VERSION } from './categories.ts'
@@ -44,7 +88,7 @@ import { driveDeploy, listOutstandingDeploys, type DeployDeps } from './deploy.t
 import { insertIdea, IdeaError } from './ideas.ts'
 import { feeIdempotencyKey, feePostings, LedgerUnavailableError, type LedgerClient } from './ledgerclient.ts'
 import { closeMarket, listDueToClose, markResolved, markSettled, voidMarket } from './markets.ts'
-import { recordSyncError, syncMarket, type MirrorDeps } from './mirror.ts'
+import { listMirrorable, recordSyncError, syncMarket, type MirrorDeps } from './mirror.ts'
 import { withOutbox, type Db } from './outbox.ts'
 import type { Proposer } from './proposer.ts'
 import {
@@ -62,6 +106,8 @@ export const MIRROR_SYNC = 'mirror.sync'
 export const RESOLUTION_POST = 'resolution.post'
 export const FEE_REPORT = 'fee.report'
 export const OUTBOX_RELAY = 'outbox.relay'
+export const DEPLOY_SWEEP = 'deploy.sweep'
+export const MIRROR_SWEEP = 'mirror.sweep'
 
 export const JOB_KINDS: readonly string[] = Object.freeze([
   IDEA_PROPOSE,
@@ -71,7 +117,12 @@ export const JOB_KINDS: readonly string[] = Object.freeze([
   RESOLUTION_POST,
   FEE_REPORT,
   OUTBOX_RELAY,
+  DEPLOY_SWEEP,
+  MIRROR_SWEEP,
 ])
+
+const SECOND = 1_000
+const MINUTE = 60 * SECOND
 
 /** The topics the idea pipeline searches. Configuration would be nicer; a constant is honest. */
 export const PROPOSAL_TOPICS: readonly string[] = Object.freeze([
@@ -103,84 +154,83 @@ export interface JobDeps {
 /**
  * Search, ask a model, store what comes back as PROPOSALS.
  *
- * Re-enqueues itself at the end, so recurrence needs no timer. `onConflict: 'keep'` on the enqueue
- * means three calls before the first runs still produce one run.
+ * **Recurrence is not this handler's business.** It used to end in a `finally` that enqueued the
+ * next run, and that enqueue was deleted by `complete()` the instant the handler returned — see the
+ * file header. The next run is armed by `rescheduleRecurring` off the runner's `completed` event.
  *
- * An unconfigured proposer is a normal outcome: the run records "not configured", completes, and
- * schedules the next one. It does not throw, so nothing backs off into a dead letter and nothing
- * logs an error every six hours for a thing nobody has set up.
+ * That relocation preserves the reason the old enqueue was in a `finally`, and it is worth saying
+ * why: a run that THROWS must not stop the schedule. It does not. A failure is retried with backoff
+ * by the runner itself, and only a job that exhausts its whole attempt budget stops recurring — at
+ * which point the dead row and `jobs_dead_total` are how an operator finds out, which is louder than
+ * a silent reschedule ever was.
+ *
+ * An unconfigured proposer is a normal outcome: the run records "not configured" and completes. It
+ * does not throw, so nothing backs off into a dead letter and nothing logs an error every six hours
+ * for a thing nobody has set up.
  */
 export function ideaProposeHandler(deps: JobDeps): Handler {
   return async (job) => {
     const now = (deps.now ?? (() => new Date()))()
-    try {
-      if (!deps.proposer.configured) {
-        deps.logger.info('idea pipeline: no proposer is configured, so there are no proposals', {
-          jobKey: job.key,
-        })
-        deps.metrics.increment('foresight_idea_runs_total', { outcome: 'not_configured' })
-        return
-      }
+    if (!deps.proposer.configured) {
+      deps.logger.info('idea pipeline: no proposer is configured, so there are no proposals', {
+        jobKey: job.key,
+      })
+      deps.metrics.increment('foresight_idea_runs_total', { outcome: 'not_configured' })
+      return
+    }
 
-      let stored = 0
-      let dropped = 0
-      for (const topic of PROPOSAL_TOPICS) {
-        const run = await deps.proposer.propose({
-          topic,
-          count: deps.proposalBatchSize,
-          now,
-        })
-        deps.metrics.increment('foresight_idea_runs_total', { outcome: run.reason })
-        for (const proposal of run.proposals) {
-          try {
-            await insertIdea(deps.sql, { ...proposal, categoryVersion: CATEGORY_VERSION }, now)
-            stored += 1
-          } catch (err) {
-            // A proposal that fails validation is DROPPED and counted, never repaired. Filling in a
-            // missing resolution source with a plausible default is how a market ends up settling
-            // from somewhere nobody named.
-            if (err instanceof IdeaError) {
-              dropped += 1
-              deps.metrics.increment('foresight_proposals_dropped_total', { reason: err.code })
-              continue
-            }
-            throw err
+    let stored = 0
+    let dropped = 0
+    for (const topic of PROPOSAL_TOPICS) {
+      const run = await deps.proposer.propose({
+        topic,
+        count: deps.proposalBatchSize,
+        now,
+      })
+      deps.metrics.increment('foresight_idea_runs_total', { outcome: run.reason })
+      for (const proposal of run.proposals) {
+        try {
+          await insertIdea(deps.sql, { ...proposal, categoryVersion: CATEGORY_VERSION }, now)
+          stored += 1
+        } catch (err) {
+          // A proposal that fails validation is DROPPED and counted, never repaired. Filling in a
+          // missing resolution source with a plausible default is how a market ends up settling
+          // from somewhere nobody named.
+          if (err instanceof IdeaError) {
+            dropped += 1
+            deps.metrics.increment('foresight_proposals_dropped_total', { reason: err.code })
+            continue
           }
+          throw err
         }
       }
-      deps.logger.info('idea pipeline ran', { stored, dropped })
-      deps.metrics.increment('foresight_proposals_stored_total', {}, stored)
-    } finally {
-      // Scheduled in a `finally` so a failed run still schedules the next one. A pipeline that
-      // stops recurring because one search timed out is a pipeline that quietly dies.
-      await deps.queue.enqueue({
-        kind: IDEA_PROPOSE,
-        key: 'global',
-        runAt: new Date(now.getTime() + deps.proposeEveryMinutes * 60_000),
-        onConflict: 'keep',
-      })
     }
+    deps.logger.info('idea pipeline ran', { stored, dropped })
+    deps.metrics.increment('foresight_proposals_stored_total', {}, stored)
   }
 }
 
 /* ------------------------------------------------------------------ deploy */
 
+/**
+ * Advance one market's deploy by one step.
+ *
+ * **It does not re-enqueue itself for the next step**, and the deletion of the four lines that did
+ * is the point of this change rather than an omission. `market.deploy` is keyed on a market id, so
+ * the runner's `completed` re-arm cannot reach it — the key is not known at boot. `deploy.sweep`
+ * below is what brings it back, unconditionally, off the database rather than off a memory of
+ * having asked.
+ *
+ * The `deployed` enqueue STAYS, because it is a different `(kind, key)`: `mirror.sync` for this
+ * market, which the row being deleted a moment later cannot touch. That is the distinction the old
+ * code missed — an enqueue of somebody else's key survives `complete()`; an enqueue of your own does
+ * not.
+ */
 export function marketDeployHandler(deps: JobDeps): Handler {
   return async (job, ctx) => {
     const marketId = typeof job.payload['marketId'] === 'string' ? job.payload['marketId'] : job.key
     const result = await driveDeploy(deps.deploy, marketId)
     await ctx.heartbeat()
-    if (result === 'broadcast' || result === 'pending' || result === 'awaiting_funds') {
-      // Not finished, and not a failure. Re-enqueued rather than left to a sweep so the common case
-      // is fast; the sweep below is what catches a row nothing re-enqueued.
-      await deps.queue.enqueue({
-        kind: MARKET_DEPLOY,
-        key: marketId,
-        payload: { marketId },
-        runAt: new Date(Date.now() + 15_000),
-        onConflict: 'earliest',
-      })
-    }
     if (result === 'deployed') {
       // The mirror starts following the moment there is something to follow.
       await deps.queue.enqueue({ kind: MIRROR_SYNC, key: marketId, payload: { marketId } })
@@ -194,6 +244,12 @@ export function marketDeployHandler(deps: JobDeps): Handler {
  * `micro-mint`'s `chain.sweep`, and the defect it names is worth restating — the frozen service had
  * no reconciler at all, so a customer who closed the tab left a broadcast deploy in `deploying` for
  * ever. Here nothing depends on a request ever coming back.
+ *
+ * **This handler existed, was tested, and was never registered.** `registerHandlers` below did not
+ * mention it, so the safety net the comment above promised was not in the process at all — which is
+ * why the annihilated self-enqueue in `marketDeployHandler` had nothing beneath it and an approved
+ * market could sit in `pending` until somebody restarted the container. It is registered now, and
+ * `jobs.test.ts` asserts that every handler in `JOB_KINDS` is.
  */
 export function deploySweepHandler(deps: JobDeps): Handler {
   return async () => {
@@ -228,18 +284,20 @@ export function marketCloseHandler(deps: JobDeps): Handler {
       })
       deps.metrics.increment('foresight_markets_closed_total')
     }
-    // One scan per minute, re-enqueued. `keep` collapses a burst into one pending run.
-    await deps.queue.enqueue({
-      kind: MARKET_CLOSE,
-      key: 'global',
-      runAt: new Date(now.getTime() + 60_000),
-      onConflict: 'keep',
-    })
+    // One scan per minute. The interval lives in `recurringJobs`, not here: a scan that scheduled
+    // its own next run scheduled a row the runner deleted a moment later.
   }
 }
 
 /* ------------------------------------------------------------------ mirror */
 
+/**
+ * Follow one market's chain activity.
+ *
+ * Keyed on the market, so — like `market.deploy` — the runner's `completed` re-arm cannot reach it
+ * and its old self-enqueue was eaten by `complete()`. `mirror.sweep` below re-enqueues it from the
+ * set of markets that have something to follow.
+ */
 export function mirrorSyncHandler(deps: JobDeps): Handler {
   return async (job) => {
     const marketId = typeof job.payload['marketId'] === 'string' ? job.payload['marketId'] : job.key
@@ -255,13 +313,27 @@ export function mirrorSyncHandler(deps: JobDeps): Handler {
       deps.metrics.increment('foresight_mirror_errors_total')
       deps.logger.warn('mirror sync failed', { marketId, err: message })
     }
-    await deps.queue.enqueue({
-      kind: MIRROR_SYNC,
-      key: marketId,
-      payload: { marketId },
-      runAt: new Date(Date.now() + 30_000),
-      onConflict: 'keep',
-    })
+  }
+}
+
+/**
+ * The mirror's sweep: every market with a contract and an unfinished life gets a sync.
+ *
+ * Written for this change, because there was no equivalent of `deploySweepHandler` here at all —
+ * `mirror.sync` was seeded only by a deploy reaching `deployed`, and then kept alive purely by the
+ * self-enqueue the runner deleted. So the mirror followed each market for exactly one pass and then
+ * stopped, and the public pool on the page froze at whatever it had read in that one pass.
+ */
+export function mirrorSweepHandler(deps: JobDeps): Handler {
+  return async () => {
+    for (const marketId of await listMirrorable(deps.sql, 200)) {
+      await deps.queue.enqueue({
+        kind: MIRROR_SYNC,
+        key: marketId,
+        payload: { marketId },
+        onConflict: 'earliest',
+      })
+    }
   }
 }
 
@@ -286,14 +358,11 @@ export function resolutionPostHandler(deps: JobDeps): Handler {
       // One at a time: the next resolution needs a nonce that only exists once this one is mined.
       if (result === 'broadcast' || result === 'pending') break
     }
-    if (outstanding.length > 0) {
-      await deps.queue.enqueue({
-        kind: RESOLUTION_POST,
-        key: resolutionLeaseKey(deps.chain, deps.network),
-        runAt: new Date(Date.now() + 15_000),
-        onConflict: 'earliest',
-      })
-    }
+    // No self-enqueue. This kind IS in `recurringJobs` — its key is `oracle:<chain>:<network>`,
+    // which is known at boot — so `rescheduleRecurring` re-arms it every 15 seconds whether or not
+    // this pass found anything. Unconditional is the correction as much as the relocation is: the
+    // old `if (outstanding.length > 0)` meant that once the queue emptied, nothing would ever look
+    // again, so a market closed after that moment could never be resolved.
   }
 }
 
@@ -383,7 +452,15 @@ export function feeReportHandler(deps: JobDeps): Handler {
 
 /* ------------------------------------------------------------------ registration */
 
-/** Everything a runner needs, in one place, so a job cannot exist without a documented key. */
+/**
+ * Everything a runner needs, in one place, so a job cannot exist without a documented key.
+ *
+ * **A kind in `JOB_KINDS` with no handler here is a kind nothing runs**, and that was not a
+ * hypothetical: `deploySweepHandler` was written, documented as the thing that "catches a row
+ * nothing re-enqueued", covered by a test, and absent from this function. `jobs.test.ts` now asserts
+ * this list and `JOB_KINDS` are the same set, so the next omission is a red build rather than a
+ * market stuck in `pending`.
+ */
 export function registerHandlers(
   deps: JobDeps,
   relay: Handler,
@@ -391,11 +468,65 @@ export function registerHandlers(
 ): void {
   register(IDEA_PROPOSE, ideaProposeHandler(deps))
   register(MARKET_DEPLOY, marketDeployHandler(deps))
+  register(DEPLOY_SWEEP, deploySweepHandler(deps))
   register(MARKET_CLOSE, marketCloseHandler(deps))
   register(MIRROR_SYNC, mirrorSyncHandler(deps))
+  register(MIRROR_SWEEP, mirrorSweepHandler(deps))
   register(RESOLUTION_POST, resolutionPostHandler(deps))
   register(FEE_REPORT, feeReportHandler(deps))
   register(OUTBOX_RELAY, relay)
+}
+
+/* ------------------------------------------------------------------ recurrence */
+
+export interface RecurringJob {
+  readonly kind: string
+  readonly key: string
+  readonly everyMs: number
+}
+
+/** The subset of `JobDeps` the schedule is computed from. Narrow so a test need not build a world. */
+export type ScheduleDeps = Pick<JobDeps, 'chain' | 'network' | 'proposeEveryMinutes'>
+
+/**
+ * Every job that must exist whether or not anything enqueued it, and how often it repeats.
+ *
+ * A recurring job is **a producer plus a leased job, never a timer**: the boot seed below plus the
+ * re-arm in `rescheduleRecurring`. So the interval survives a restart, is visible in a table an
+ * operator can query, and is claimed by exactly one replica.
+ *
+ * The intervals are the ones the old self-enqueues asked for, kept deliberately identical so that
+ * this change is a fix and not also a retuning:
+ *
+ *   | Kind             | Every | Where the number comes from                                      |
+ *   |------------------|-------|------------------------------------------------------------------|
+ *   | outbox.relay     | 1s    | ledger's relay cadence. Nothing else moves an event off this box. |
+ *   | deploy.sweep     | 15s   | `marketDeployHandler`'s old 15s follow-up.                        |
+ *   | resolution.post  | 15s   | `resolutionPostHandler`'s old 15s follow-up.                      |
+ *   | mirror.sweep     | 30s   | `mirrorSyncHandler`'s old 30s follow-up.                          |
+ *   | market.close     | 60s   | `marketCloseHandler`'s old 60s scan.                              |
+ *   | fee.report       | 60s   | **NEW.** This one never had a follow-up at all — it was seeded at |
+ *   |                  |       | boot and nothing rescheduled it even in intent, so a fee indexed  |
+ *   |                  |       | after boot was never posted to the ledger until a restart.        |
+ *   | idea.propose     | env   | `FORESIGHT_PROPOSE_EVERY_MINUTES`.                                |
+ *
+ * `deploy.sweep` at 15s is the fast path for a market mid-deploy, with one honest caveat:
+ * `listOutstandingDeploys` skips a row whose market lease is still held, and `markSigned` holds that
+ * lease for `leaseMs` (120s). So a market that has just been signed is re-driven when its lease
+ * lapses rather than 15 seconds later. That is a bounded delay on a poll, not a lost deploy, and it
+ * is the property that actually matters: **nothing can be stranded, because the scan is
+ * unconditional and does not depend on any earlier run having enqueued anything.**
+ */
+export function recurringJobs(deps: ScheduleDeps): RecurringJob[] {
+  return [
+    { kind: OUTBOX_RELAY, key: 'global', everyMs: 1 * SECOND },
+    { kind: DEPLOY_SWEEP, key: 'global', everyMs: 15 * SECOND },
+    { kind: RESOLUTION_POST, key: resolutionLeaseKey(deps.chain, deps.network), everyMs: 15 * SECOND },
+    { kind: MIRROR_SWEEP, key: 'global', everyMs: 30 * SECOND },
+    { kind: MARKET_CLOSE, key: 'global', everyMs: 60 * SECOND },
+    { kind: FEE_REPORT, key: 'global', everyMs: 60 * SECOND },
+    { kind: IDEA_PROPOSE, key: 'global', everyMs: deps.proposeEveryMinutes * MINUTE },
+  ]
 }
 
 /**
@@ -404,16 +535,51 @@ export function registerHandlers(
  * `onConflict: 'keep'` throughout, so N replicas booting together produce one pending run of each
  * rather than N. The `(kind, key)` unique constraint in `JOBS_SCHEMA_SQL` is what makes that true.
  */
-export async function seedRecurring(queue: JobQueue, chain: ChainId, network: Network): Promise<void> {
-  await queue.enqueue({ kind: IDEA_PROPOSE, key: 'global', onConflict: 'keep' })
-  await queue.enqueue({ kind: MARKET_CLOSE, key: 'global', onConflict: 'keep' })
-  await queue.enqueue({ kind: FEE_REPORT, key: 'global', onConflict: 'keep' })
-  await queue.enqueue({ kind: OUTBOX_RELAY, key: 'global', onConflict: 'keep' })
-  await queue.enqueue({
-    kind: RESOLUTION_POST,
-    key: resolutionLeaseKey(chain, network),
-    onConflict: 'keep',
-  })
+export async function seedRecurring(queue: JobQueue, deps: ScheduleDeps): Promise<void> {
+  for (const job of recurringJobs(deps)) {
+    await queue.enqueue({ kind: job.kind, key: job.key, onConflict: 'keep' })
+  }
+}
+
+/**
+ * Re-arm a recurring job once it has finished.
+ *
+ * **It cannot re-arm itself from inside its own handler**, and this function exists because for the
+ * whole life of this service it tried to. The runner deletes the row on success AFTER the handler
+ * returns (`jobs/src/index.ts:407` → `:223`), and `enqueue` conflicts on `(kind, key)` against the
+ * handler's own still-present row — so a self-enqueue was annihilated by the delete that followed
+ * it and the schedule stopped dead at the first completion. The `completed` event is emitted after
+ * `complete()` resolves, which is the only point at which the row is provably gone.
+ *
+ * A dead-lettered recurring job is deliberately **not** re-armed. The row stays, `jobs_dead_total`
+ * increments and `jobs_overdue` climbs, which is how an operator finds out. Silently rescheduling a
+ * job that has exhausted its attempt budget hides a permanent fault behind a busy loop.
+ *
+ * `earliest` rather than `keep`: if something else has already asked for this kind sooner — the
+ * approve route enqueuing a deploy, say — the sooner time wins and the periodic re-arm never pushes
+ * it out.
+ */
+export function rescheduleRecurring(
+  queue: JobQueue,
+  logger: Logger,
+  deps: ScheduleDeps,
+): (event: RunnerEvent) => void {
+  const byKey = new Map(recurringJobs(deps).map((job) => [`${job.kind}|${job.key}`, job]))
+  return (event) => {
+    if (event.type !== 'completed') return
+    const recurring = event.kind && event.key ? byKey.get(`${event.kind}|${event.key}`) : undefined
+    if (!recurring) return
+    void queue
+      .enqueue({
+        kind: recurring.kind,
+        key: recurring.key,
+        runAt: new Date(Date.now() + recurring.everyMs),
+        onConflict: 'earliest',
+      })
+      .catch((err: unknown) =>
+        logger.error('failed to re-arm a recurring job', { kind: recurring.kind, key: recurring.key, err }),
+      )
+  }
 }
 
 export { chainKey }
