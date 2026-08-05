@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { RATE_SCALE, chainSpec } from '@cloudsforge/contracts-chain'
+import { CHAINS, RATE_SCALE, chainSpec, isRetiredAsset, type AssetCode } from '@cloudsforge/contracts-chain'
 import {
   POOL_ASSET,
   POOL_DECIMALS,
@@ -237,6 +237,50 @@ test('chain decimals are read from contracts-chain, for every asset a stake can 
   assert.equal(stakeAssetDecimals('LTC'), 8)
   assert.equal(stakeAssetDecimals('ETH'), 18)
   assert.equal(stakeAssetDecimals('EMBER'), 18)
+})
+
+test('every asset contracts-chain names is nameable here, at that package’s decimals', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // THE DRIFT GUARD, AND IT IS THE POINT OF THE CASE ABOVE BEING INSUFFICIENT.
+  //
+  // The four assertions above pass whether or not this service knows about a fifth asset — they
+  // can only check what somebody remembered to add to them, which is the shape of check that let
+  // `CHAIN_DECIMALS` keep a hand-typed key list while claiming to be "read from the pinned
+  // package". This iterates the UPSTREAM record instead, so an asset added to `CHAINS` and not
+  // reachable here is a failure rather than a silence.
+  //
+  // Both halves are asserted, because they fail differently: an asset this cannot NAME is a stake
+  // refused for a reason that is not true, and an asset named at the wrong SCALE is money taken in
+  // the wrong amount. MUTATION: put the old literal list back with LTC removed → the LTC iteration
+  // throws `bad_asset` and this reddens; change any `chainSpec` decimals → the second assertion
+  // reddens.
+  //
+  // SHARD is expected to be refused and is asserted as such rather than skipped: it is retired,
+  // `isRetiredAsset` is what refuses it, and "nameable" and "stakeable" are deliberately two
+  // questions. A silent skip here would hide the day a retired asset became parseable again.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  const codes = Object.keys(CHAINS) as AssetCode[]
+  assert.ok(codes.length >= 6, 'contracts-chain names fewer assets than it did; check the import')
+
+  for (const code of codes) {
+    if (isRetiredAsset(code)) {
+      assert.throws(
+        () => parseStakeAssetCode(code),
+        (err: unknown) => err instanceof StakeAssetError && err.code === 'retired_asset',
+        `${code} is retired and must be refused with that reason, not a generic one`,
+      )
+      continue
+    }
+    // The parser's own return type is `IssuableAssetCode`, so passing its result on is what makes
+    // "SHARD reaches `stakeAssetDecimals`" a compile error rather than a case this loop must dodge.
+    const issuable = parseStakeAssetCode(code)
+    assert.equal(issuable, code, `${code} is named upstream but not parseable here`)
+    assert.equal(
+      stakeAssetDecimals(issuable),
+      chainSpec(code).decimals,
+      `${code} is stated at a different scale here than in contracts-chain`,
+    )
+  }
 })
 
 test('amounts render exactly, with no float anywhere near them', () => {

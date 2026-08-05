@@ -63,12 +63,36 @@ let pricing: FakePricing
 let ledger: FakeLedger
 let policy: FakePolicy
 
+/** One registry row as the migrations leave it. See `before`. */
+interface SeededAsset {
+  readonly asset_code: string
+  readonly enabled: boolean
+  readonly blocked_reason: string | null
+}
+let seededRegistry: readonly SeededAsset[] = []
+
 const PLAYER_ID = '00000000-0000-4000-8000-000000000002'
 const PLAYER: Principal = { kind: 'user', userId: PLAYER_ID, roles: ['player'] } as unknown as Principal
 const SUBJECT = `user:${PLAYER_ID}`
 
 const ONE_HUNDREDTH_BTC = '1000000'
 const TWO_THOUSAND_FOUR_HUNDRED_EMBER = '2400000000000000000000'
+
+/**
+ * The asset that is still OFF, and the one the "disabled" tests are pointed at.
+ *
+ * Named once because it moved: these tests used LTC, whose blocker is gone (migration 10). USDT
+ * on Ethereum is the row whose recorded reason is STILL TRUE — `pricing/src/rates.ts:57` derives
+ * its quoted set from `ON_CHAIN_ASSETS`, which holds `AssetCode`s only, and the live service
+ * answers 404 for this urn. A real seeded row rather than a fixture invented for the test, so
+ * these assertions exercise the registry the deploy actually creates; and if USDT is ever priced
+ * and turned on, this going red is correct — it asks whoever did it to point these at whatever
+ * is off then, which is the check LTC never got.
+ */
+const DISABLED_ASSET = 'TOKEN:eth:mainnet:0xdac17f958d2ee523a2206206994597c13d831ec7'
+
+/** One litecoin, in litoshis. `chainSpec('LTC').decimals` is 8 — not EMBER's 18. */
+const ONE_LTC = '100000000'
 
 function fakeVerifier(): Verifier {
   return {
@@ -84,6 +108,20 @@ before(async () => {
   if (!enabled) return
   sql = openDb()
   await migrateTestDb(sql)
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // THE REGISTRY AS THE MIGRATIONS LEAVE IT, READ ONCE, SO `beforeEach` RESTORES RATHER THAN
+  // DECIDES.
+  //
+  // This used to be a typed list — `where asset_code in ('EMBER','BTC','ETH')` — and the moment
+  // migration 10 enabled LTC that list would have had to be edited by hand to match. Worse, if
+  // it HAD been edited, the registry test below would have been asserting what `beforeEach` just
+  // wrote rather than what the migration seeds, and would pass with no migration at all. It did,
+  // while this change was being made, which is how the snapshot got written.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  seededRegistry = await sql<SeededAsset[]>`
+    select asset_code, enabled, blocked_reason from stake_assets order by asset_code
+  `
+  assert.ok(seededRegistry.length > 0, 'the migrations seeded no stake assets')
   pricing = fakePricing()
   ledger = fakeLedger()
   policy = fakePolicy()
@@ -126,10 +164,15 @@ after(async () => {
 beforeEach(async () => {
   if (!enabled) return
   await resetForesight(sql)
-  // The registry is REFERENCE DATA seeded by the migration and is deliberately not truncated. It
-  // is restored here so one test disabling an asset cannot change what the next one is testing.
-  await sql`update stake_assets set enabled = true, blocked_reason = null
-             where asset_code in ('EMBER','BTC','ETH')`
+  // The registry is REFERENCE DATA seeded by the migrations and is deliberately not truncated. It
+  // is restored to the SEEDED state — not to a state typed here — so one test switching an asset
+  // off cannot change what the next one is testing, and so nothing in this file can accidentally
+  // stand in for the migration it is meant to be checking.
+  for (const row of seededRegistry) {
+    await sql`update stake_assets
+                 set enabled = ${row.enabled}, blocked_reason = ${row.blocked_reason}
+               where asset_code = ${row.asset_code}`
+  }
   pricing.setUnavailable('BTC', false)
   pricing.setUnavailable('EMBER', false)
   ledger.reset()
@@ -172,8 +215,8 @@ test('the registry names every asset, and a disabled one says why', { skip }, as
   }[]
   const byCode = new Map(assets.map((asset) => [asset.assetCode, asset]))
 
-  // The four the owner named, plus the pool asset. LTC and USDT are PRESENT and disabled rather
-  // than absent: a user holding Litecoin is owed "not yet, and here is what is missing".
+  // The four the owner named, plus the pool asset. USDT is PRESENT and disabled rather than
+  // absent: a user holding it is owed "not yet, and here is what is missing".
   for (const code of ['EMBER', 'BTC', 'ETH', 'LTC']) {
     assert.ok(byCode.has(code), `${code} should be nameable`)
   }
@@ -185,10 +228,30 @@ test('the registry names every asset, and a disabled one says why', { skip }, as
   assert.equal(byCode.get('LTC')?.decimals, 8)
   assert.equal([...byCode.values()].find((a) => a.assetCode.startsWith('TOKEN:'))?.decimals, 6)
 
-  // A disabled asset carries its reason. MUTATION: drop `stake_assets_disabled_has_reason` and
-  // seed LTC with a null reason → this reddens.
-  assert.equal(byCode.get('LTC')?.enabled, false)
-  assert.match(byCode.get('LTC')?.blockedReason ?? '', /pricing/i)
+  // ── LITECOIN IS ON, AND THIS ASSERTS THE NEW STATE RATHER THAN LEAVING IT UNASSERTED.
+  //
+  // This used to read `enabled, false` with a reason matching /pricing/. It was correct when it
+  // was written and it stopped being correct the moment contracts listed LTC in ON_CHAIN_ASSETS
+  // — at which point a green suite was actively DEFENDING a stale refusal. Inverted rather than
+  // deleted, because the failure worth catching is not "LTC got turned off again", it is "nobody
+  // is watching either way".
+  //
+  // `blockedReason` must be NULL and not merely falsy: `stake_assets_enabled_has_no_reason`
+  // (migration 9) exists so an asset cannot be simultaneously on and carrying an excuse, and a
+  // row enabled by hand with its old reason left behind is exactly what that constraint refuses.
+  // MUTATION: have migration 10 set `enabled = true` without nulling `blocked_reason` → the
+  // migration itself raises 23514 and every database test in this file reddens.
+  assert.equal(byCode.get('LTC')?.enabled, true)
+  assert.equal(byCode.get('LTC')?.blockedReason, null)
+
+  // A disabled asset still carries its reason, and USDT-on-Ethereum is the row that proves it:
+  // pricing quotes AssetCodes and has no route for a TOKEN: urn, verified against the live
+  // service — `GET /rates/TOKEN:eth:mainnet:0xdac1…` answers 404 `not_quoted`. That reason is
+  // still true, so the row stays off. MUTATION: drop `stake_assets_disabled_has_reason` and seed
+  // it with a null reason → this reddens.
+  const usdt = [...byCode.values()].find((a) => a.assetCode.startsWith('TOKEN:'))
+  assert.equal(usdt?.enabled, false)
+  assert.match(usdt?.blockedReason ?? '', /pricing/i)
 })
 
 test('a retired asset cannot enter the registry at all', { skip }, async () => {
@@ -227,12 +290,47 @@ test('a quote states both amounts, both rates and the sentence', { skip }, async
 
 test('a quote in a disabled asset is refused with the reason, not silently priced', { skip }, async () => {
   const marketId = await openMarket()
+  // `reads` accumulates across the file, so the claim is "this call added none" and not "none have
+  // ever happened" — the second would be vacuous by the time this case runs.
+  const readsBefore = pricing.reads.length
   const response = await call('POST', `/markets/${marketId}/stake-quote`, {
     token: 'player',
-    body: { asset: 'LTC', amount: '100000000' },
+    body: { asset: DISABLED_ASSET, amount: '1000000' },
   })
   assert.equal(response.status, 409)
   assert.equal(response.body['error']?.['code'], 'asset_disabled')
+  // The registry is consulted BEFORE pricing (`server.ts:770-784`), so the reader gets the
+  // platform's own sentence rather than "the rate board is having a bad minute".
+  // MUTATION: move the `!asset.enabled` check below the `stakeRates` call → the read happens and
+  // this reddens, even though the status code and the error code are unchanged.
+  assert.match(response.body['error']?.['message'] ?? '', /pricing/i)
+  assert.equal(pricing.reads.length, readsBefore, 'pricing was called for a refused asset')
+})
+
+test('a Litecoin quote prices at eight decimals, not at EMBER’s eighteen', { skip }, async () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // THE POSITIVE HALF OF MIGRATION 10. Enabling an asset is only half of it — the other half is
+  // that the amount is read at the asset's OWN scale. LTC is 8 places like BTC and the pool is
+  // EMBER's 18, so a quote that reached for the pool's decimals would size this stake by a
+  // factor of 10¹⁰ and it would do it silently.
+  //
+  // 1 LTC at $45 against EMBER at $0.25 is 180 EMBER. MUTATION: make `quoteStake` read
+  // `POOL_DECIMALS` instead of the registry row's `decimals` → the answer becomes 0 and this
+  // reddens, which is the failure `assertRegistryDecimals` exists for.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  pricing.setRate('LTC', 45_000_000n)
+  const marketId = await openMarket()
+  const response = await call('POST', `/markets/${marketId}/stake-quote`, {
+    token: 'player',
+    body: { asset: 'LTC', amount: ONE_LTC },
+  })
+  assert.equal(response.status, 200)
+  assert.equal(response.body['stakeAsset'], 'LTC')
+  assert.equal(response.body['stakeDecimals'], 8)
+  assert.equal(response.body['stakeAmountFormatted'], '1')
+  assert.equal(response.body['poolAmount'], (180n * 10n ** 18n).toString())
+  assert.equal(response.body['stakeRateUsdScaled'], '45000000')
+  assert.equal(response.body['poolRateUsdScaled'], EMBER_USD_SCALED.toString())
 })
 
 /* ------------------------------------------------------------------ taking the stake */
@@ -474,7 +572,31 @@ test('a stake in a disabled asset is refused by the database, not only by the ro
   // The route checks it and gives a readable 409. This is what holds when a future write path
   // forgets to. MUTATION: delete the `asset_enabled` branch of the trigger → this reddens.
   const marketId = await openMarket()
-  await assert.rejects(insertRaw(marketId, { stake_asset_code: `'LTC'` }), /does not currently accept|not an asset/)
+  await assert.rejects(
+    insertRaw(marketId, { stake_asset_code: `'${DISABLED_ASSET}'` }),
+    /does not currently accept|not an asset/,
+  )
+})
+
+test('an asset the operator switches off is refused again, without a migration', { skip }, async () => {
+  // Migration 10 turned LTC on. The registry is an OPERATOR SWITCH and not a code constant, which
+  // is the property that made enabling it an UPDATE rather than a rewrite — so it has to hold in
+  // the other direction too, or "turn it off while pricing is broken" would need a release.
+  // MUTATION: hard-code `enabled` true for chain assets in `findStakeAsset` → this reddens.
+  const marketId = await openMarket()
+  await sql`update stake_assets
+               set enabled = false, blocked_reason = 'switched off by an operator for this test'
+             where asset_code = 'LTC'`
+  const response = await call('POST', `/markets/${marketId}/stake-quote`, {
+    token: 'player',
+    body: { asset: 'LTC', amount: ONE_LTC },
+  })
+  assert.equal(response.status, 409)
+  assert.equal(response.body['error']?.['code'], 'asset_disabled')
+  await assert.rejects(
+    insertRaw(marketId, { stake_asset_code: `'LTC'` }),
+    /does not currently accept|not an asset/,
+  )
 })
 
 test('zero amounts and zero rates are unrepresentable', { skip }, async () => {
