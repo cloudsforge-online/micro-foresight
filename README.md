@@ -331,6 +331,12 @@ against another file's inserts.
 
 ## The house seed: a disclosed, opinion-free counterparty
 
+> **Operators: the runbook is `deploy/docs/house-seed.md`** (repository `micro-deploy`)
+> — where the EMBER comes from, who holds the key and what that exposes, the exact
+> configuration on both networks, the numbered procedure with an on-chain verification
+> after each step, the caps, what it costs, and how to unwind. Read it before moving
+> money. This section explains the design; that document tells you what to do.
+
 A parimutuel market with one bettor is a refund machine — the lone winner splits a pool containing
 only their own stake, so nobody's first bet can ever be interesting. `docs/ecosystem/21` decides
 the platform may put its own money in first, and §5 gives the shape: **symmetric, at open, never
@@ -407,10 +413,13 @@ improvise.
   outside this estate's custody (see above), so this service *records and gates* the seed rather
   than sending it. Automating the send would need a custody transaction shape that does not exist
   and should not be widened for this.
-- **`foresight-web` rendering the disclosure.** Phase 1 serves it on `GET /markets/:id` — the
-  sentence, the amounts, the address and the on-chain evidence hashes — and pins its presence
-  with force in `houseseed.test.ts`. Rendering it is a later client pass in the same programme,
-  and 21 §7.6's proof is only half-held until that lands.
+- ~~**`foresight-web` rendering the disclosure.**~~ **This has landed** — corrected 2026-08-06,
+  because the bullet claimed a gap that no longer exists. `GET /markets/:id` serves the sentence,
+  the amounts, the address and the on-chain evidence hashes, and `micro-foresight-web` renders all
+  of it above the ratio bar: `foresight-web/src/components/houseseed.tsx`, mounted at
+  `foresight-web/src/pages/market.tsx:271`. The client re-derives symmetry and pool share rather
+  than repeating them, and renders a loud alarm if the numbers do not support the sentence. 21
+  §7.6's proof is held in full.
 
 ### Found while reading, reported not fixed
 
