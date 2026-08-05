@@ -130,7 +130,7 @@ const upstreams = buildUpstreams(env, {
     }
   },
 })
-const { custody, indexer, ledger, policy } = upstreams
+const { custody, indexer, ledger, policy, pricing } = upstreams
 
 // ────────────────────────────────────────────────────────────────────────────────────────────────
 // Said at boot, at the level its consequence deserves, because the alternative is discovering it as
@@ -193,6 +193,11 @@ lifecycle
   .addProbe(httpProbe('indexer', `${env.indexerUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('ledger', `${env.ledgerUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('policy', `${env.policyUrl}/livez`, { kind: 'soft' }))
+  // SOFT, like the others. Pricing being down stops a NON-EMBER stake being taken — the route
+  // refuses with `rate_unavailable` at the point of use — and stops nothing else this service does.
+  // A hard probe would take the whole service out of rotation for a feature most requests do not
+  // touch, which is the trade `ledger/src/upstreams.ts` declines for the same shape of dependency.
+  .addProbe(httpProbe('pricing', `${env.pricingUrl}/livez`, { kind: 'soft' }))
 
 // 7. The dependency bundles, built once and shared so the routes and the worker cannot disagree
 //    about which network they are on or which bounds they are enforcing.
@@ -277,6 +282,13 @@ const server = createServer({
   // here": approving with a seed refuses with a sentence rather than degrading into one.
   houseAddress: env.houseAddress,
   engagementPolicies: upstreams.engagementPolicies,
+  // The rate source and the ledger, for a stake denominated in something the pool is not. Both
+  // fail closed: an unreadable rate refuses the stake, and a ledger that does not answer leaves an
+  // `accepted` row the reconciler finishes rather than a movement nobody recorded.
+  pricing,
+  ledger,
+  // Absent is a supported mode: wallet stakes only, and the custodial routes say so.
+  custodialAddress: env.custodialAddress,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

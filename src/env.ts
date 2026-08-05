@@ -243,6 +243,13 @@ export interface Env {
   readonly custodyUrl: string
   readonly indexerUrl: string
   readonly ledgerUrl: string
+  /**
+   * micro-pricing, for the two rates a non-EMBER stake is denominated by. **Required**, not
+   * optional: this service now takes stakes in assets whose value it cannot state without asking,
+   * and a deployment without a rate source would accept those stakes and price them at nothing.
+   * The rate board is public (`pricing/src/server.ts:9`), so no credential is presented.
+   */
+  readonly pricingUrl: string
   readonly policyUrl: string
   /**
    * A pre-minted service token, kept ONLY as the bridge while the deploy still supplies one.
@@ -290,6 +297,17 @@ export interface Env {
    * published the way the platform miners' coinbase addresses are (21 §3).
    */
   readonly houseAddress: string | undefined
+  /**
+   * The published platform address a CUSTODIAL market position is staked from — the house seed's
+   * arrangement, for the house seed's reason: custody has no signing shape that calls
+   * `stake(uint8)` and `SIGNABLE_PURPOSES` does not include `user`
+   * (`custody/src/gates.ts:65`), so a custodial bettor's EMBER reaches the pool through an
+   * address the platform publishes and funds, exactly as the seed does.
+   *
+   * **Absent is a supported mode**: this deployment takes wallet stakes only, and every custodial
+   * route answers 503 with that sentence rather than half-working.
+   */
+  readonly custodialAddress: string | undefined
   /**
    * micro-admin-api, for reading the engagement caps at market approval. Absent is the same
    * supported mode: no caps readable, no seeds planned (21 §8).
@@ -403,6 +421,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
+    pricingUrl: required(source, 'PRICING_URL'),
     policyUrl: required(source, 'POLICY_URL'),
     serviceToken: optionalSecret(source, 'FORESIGHT_SERVICE_TOKEN'),
     upstreamDeadlineMs: integer(source, 'FORESIGHT_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
@@ -414,6 +433,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
 
     treasuryAddress: address(source, 'FORESIGHT_TREASURY_ADDRESS'),
     houseAddress: optionalAddress(source, 'FORESIGHT_HOUSE_ADDRESS'),
+    custodialAddress: optionalAddress(source, 'FORESIGHT_CUSTODIAL_ADDRESS'),
     adminApiUrl: optionalOrUndefined(source, 'ADMIN_API_URL'),
     oracleAddress: address(source, 'FORESIGHT_ORACLE_ADDRESS'),
     oracleUserId: required(source, 'FORESIGHT_ORACLE_USER_ID'),

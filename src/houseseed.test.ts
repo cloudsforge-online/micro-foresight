@@ -38,6 +38,8 @@ import {
   skip,
   testMetrics,
   type FakeSeedPolicyClient,
+  fakeLedger,
+  fakePricing,
 } from './testsupport.ts'
 
 let sql: postgres.Sql
@@ -83,6 +85,9 @@ before(async () => {
     defaultFeeBps: 200,
     defaultDisputeWindowSeconds: 86_400,
     houseAddress: HOUSE,
+    pricing: fakePricing(),
+    ledger: fakeLedger(),
+    custodialAddress: undefined,
     engagementPolicies: seedPolicy,
   }
   server = createServer(deps)

@@ -67,6 +67,23 @@ import {
   type MarketStatus,
 } from './markets.ts'
 import { poolOf, positionOf } from './mirror.ts'
+import {
+  CustodialStakeError,
+  acceptStake,
+  custodialPositionOf,
+  escrowPostings,
+  findStakeAsset,
+  findStakeByKey,
+  listStakeAssets,
+  quoteStake,
+  quoteView,
+  recordEscrowEntry,
+  stakeDisclosure,
+  stakeIdempotencyKey,
+} from './custodialstakes.ts'
+import { POOL_ASSET, StakeAssetError, parseStakeAssetCode } from './stakeassets.ts'
+import { RateUnavailableError, type PricingClient } from './pricingclient.ts'
+import { LedgerRefusedError, LedgerUnavailableError, type LedgerClient } from './ledgerclient.ts'
 import { canonicalDocument } from './questiondoc.ts'
 import { withOutbox, type Db } from './outbox.ts'
 import type { PolicyClient } from './policyclient.ts'
@@ -116,6 +133,25 @@ export interface ServerDeps {
    * `adminapiclient.ts` for the recorded decision and the fail-closed rule.
    */
   readonly engagementPolicies: EngagementPolicyClient | null
+  /**
+   * The rate source for a stake denominated in something other than EMBER. Fail-closed: an
+   * unreadable rate refuses the stake rather than guessing one — `pricingclient.ts`.
+   */
+  readonly pricing: PricingClient
+  /**
+   * Where a custodial stake's money actually moves. This service holds no balances; the ledger
+   * does, and a custodial stake is an entry there.
+   */
+  readonly ledger: LedgerClient
+  /**
+   * The published platform address a custodial market position is staked from on chain — the
+   * house seed's arrangement, for the house seed's reason (`houseseed.ts`, and
+   * `custody/src/gates.ts:65`, which does not sign for a user and must not learn to).
+   *
+   * Undefined is a supported mode: this deployment takes wallet stakes only, and every custodial
+   * route refuses plainly rather than half-working.
+   */
+  readonly custodialAddress: string | undefined
   readonly beforeScrape?: () => Promise<void>
   readonly now?: () => Date
 }
@@ -152,6 +188,12 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       help: 'Resolver creations that reached a node.',
       kind: 'counter',
       labels: [],
+    })
+    .register({
+      name: 'foresight_custodial_stakes_total',
+      help: 'Custodial stakes by outcome. `policy_degraded` means policy was unreachable and staking refused.',
+      kind: 'counter',
+      labels: ['outcome'],
     })
     .register({
       name: 'foresight_markets_closed_total',
@@ -425,6 +467,37 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
     if (err instanceof ResolutionError) {
       return errorReply(err.status, err.code, err.message, ctx.requestId)
     }
+    if (err instanceof StakeAssetError || err instanceof CustodialStakeError) {
+      return errorReply(err.status, err.code, err.message, ctx.requestId)
+    }
+    if (err instanceof RateUnavailableError) {
+      // FAIL CLOSED. An unread rate is not a default one, and the alternative to refusing is
+      // guessing at how much of somebody's money to take — `pricingclient.ts`.
+      ctx.log.warn('stake refused: a rate was unreadable', { asset: err.assetCode, err: err.message })
+      return errorReply(
+        503,
+        'rate_unavailable',
+        `${err.message} — a stake cannot be priced in an asset the platform cannot quote; retry shortly`,
+        ctx.requestId,
+      )
+    }
+    if (err instanceof LedgerRefusedError) {
+      // The ledger LOOKED at it and said no — an insufficient balance is this, and it is the
+      // user's answer rather than an incident. Its own status is carried through rather than
+      // flattened, so 'you do not have that much BTC' does not present as a platform fault.
+      return errorReply(err.status, `ledger_${err.code}`, err.message, ctx.requestId)
+    }
+    if (err instanceof LedgerUnavailableError) {
+      // We do not know whether the entry posted. The stake row exists in `accepted` with a null
+      // escrow entry, which is the state the reconciler finishes — so this is a retry, not a loss.
+      ctx.log.error('the ledger did not answer a stake', { err: err.message })
+      return errorReply(
+        503,
+        'ledger_unavailable',
+        'the stake was recorded but the ledger did not confirm it; retry with the same Idempotency-Key',
+        ctx.requestId,
+      )
+    }
     if (err instanceof IdeaError) {
       const status = err.code === 'not_found' ? 404 : err.code === 'not_proposed' ? 409 : 400
       return errorReply(status, err.code, err.message, ctx.requestId)
@@ -639,6 +712,262 @@ function buildRoutes(): Route[] {
           asset: 'EMBER',
           policy: { decision: verdict.decision, reasons: verdict.reasons, decisionId: verdict.decisionId },
           closeTime: market.closeTime.toISOString(),
+        },
+      }
+    }),
+
+    /* ------------------------------------------------- staking with something other than EMBER */
+
+    /**
+     * What a bettor may bring, and what each one costs them to bring.
+     *
+     * Public, and it lists the DISABLED assets too, with the reason. A user who arrived holding
+     * Litecoin is owed the sentence "not yet, and here is what is missing" rather than a list that
+     * silently omits it — that omission is what makes somebody think the platform has never heard
+     * of their coin.
+     */
+    define('GET', '/stake-assets', async (_ctx, deps) => {
+      const assets = await listStakeAssets(deps.sql)
+      return {
+        status: 200,
+        body: {
+          // Said once, at the top, because it is the fact everything below depends on: the pool is
+          // one unit and it is this one. See `stakeassets.ts` for why the alternative was refused.
+          poolAsset: POOL_ASSET,
+          custodialStakingAvailable: deps.custodialAddress !== undefined,
+          disclosure: stakeDisclosure(),
+          assets: assets.map((asset) => ({
+            assetCode: asset.assetCode,
+            displayName: asset.displayName,
+            decimals: asset.decimals,
+            enabled: asset.enabled,
+            blockedReason: asset.blockedReason,
+          })),
+        },
+      }
+    }),
+
+    /**
+     * Price a stake without taking it — what the stake screen shows before the user commits.
+     *
+     * **Not durable, deliberately.** A quote a client could hold and present later would be a free
+     * option written by the platform: the user waits for the rate to move their way and then
+     * spends it. The rate that binds is the one read at the moment the stake is taken, and it is
+     * the one written on the row.
+     */
+    define('POST', '/markets/:id/stake-quote', async (ctx, deps) => {
+      await authenticate(ctx, deps)
+      const id = uuidParam(ctx, 'id')
+      const body = await readJson(ctx.req)
+      const assetCode = parseStakeAssetCode(body['asset'])
+      const amount = requireWei(body, 'amount')
+
+      const market = await findMarket(deps.sql, id)
+      if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
+      if (market.status !== 'open') {
+        return errorReply(409, 'not_open', `this market is ${market.status}`, ctx.requestId)
+      }
+      const asset = await findStakeAsset(deps.sql, assetCode)
+      if (!asset) {
+        return errorReply(404, 'unknown_asset', `${assetCode} is not a stake asset`, ctx.requestId)
+      }
+      // BEFORE the rate is read, not after. `quoteStake` refuses a disabled asset too — but by
+      // then a call has been spent on pricing, and pricing does not quote the assets that are
+      // disabled *because* it does not quote them. The user would get 'the rate board is having a
+      // bad minute' instead of 'this platform does not accept Litecoin yet, and here is why'.
+      if (!asset.enabled) {
+        return errorReply(
+          409,
+          'asset_disabled',
+          asset.blockedReason ?? `${assetCode} is not currently accepted`,
+          ctx.requestId,
+        )
+      }
+      const rates = await deps.pricing.stakeRates(assetCode)
+      const quote = quoteStake({ asset, stakeAmount: amount, rates })
+      return { status: 200, body: { marketId: id, ...quoteView(quote) } }
+    }),
+
+    /**
+     * Take a custodial stake.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THIS IS THE ONE ROUTE IN THIS SERVICE THAT MOVES MONEY, AND IT MOVES IT IN THE LEDGER.**
+     *
+     * The file header used to say there was no such route, and for the self-custody path there
+     * still is not — `stake-intent` hands a wallet some calldata and nothing else. But a BTC
+     * holder has no EMBER key and custody will not sign for them
+     * (`custody/src/gates.ts:65`, and widening it is refused), so their stake has to be an entry
+     * in the ledger. No key is created here. Nothing here signs. The platform's aggregate position
+     * reaches the chain from its own published address, afterwards, exactly as the house seed does.
+     *
+     * The order is: read the rate → write the row → post the entry. A crash after the row and
+     * before the entry leaves an `accepted` stake with a null `escrow_entry_id`, which is a state
+     * the operator can see and finish. The reverse order loses the reason for a movement of a
+     * user's money, and there is no recovering that.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('POST', '/markets/:id/stakes', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind !== 'user') {
+        return errorReply(
+          403,
+          'not_a_user',
+          'a custodial stake belongs to a user; a service has no balance to stake',
+          ctx.requestId,
+        )
+      }
+      const custodialAddress = deps.custodialAddress
+      if (custodialAddress === undefined) {
+        return errorReply(
+          503,
+          'custodial_staking_unconfigured',
+          'this deployment takes wallet stakes only: no platform staking address is configured',
+          ctx.requestId,
+        )
+      }
+      const id = uuidParam(ctx, 'id')
+      const clientKey = idempotencyKeyOf(ctx)
+      const body = await readJson(ctx.req)
+      const assetCode = parseStakeAssetCode(body['asset'])
+      const amount = requireWei(body, 'amount')
+      const outcome = requireInteger(body, 'outcome', 0, 1)
+      const subject = subjectOf(principal)
+
+      // Namespaced by subject as well as by the client's key. Two users may legitimately send the
+      // same key, and a key that did not carry the subject would answer the second one with the
+      // first one's stake — somebody else's position, in somebody else's name.
+      const key = `${subject}:${clientKey}`
+      const existing = await findStakeByKey(deps.sql, key)
+      if (existing) {
+        // A retry replays. It does NOT re-price: answering a retry at a moved rate is how one user
+        // action becomes two trades — `wallet/src/money.ts`'s conversion makes the same argument
+        // about the same failure.
+        return {
+          status: 200,
+          body: { stake: stakeSummary(existing), replayed: true, disclosure: stakeDisclosure() },
+        }
+      }
+
+      const market = await findMarket(deps.sql, id)
+      if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
+      const now = (deps.now ?? (() => new Date()))()
+      if (market.status !== 'open') {
+        return errorReply(409, 'not_open', `this market is ${market.status}`, ctx.requestId)
+      }
+      if (market.closeTime.getTime() <= now.getTime()) {
+        return errorReply(409, 'closed', 'this market has reached its close time', ctx.requestId)
+      }
+      const asset = await findStakeAsset(deps.sql, assetCode)
+      if (!asset) {
+        return errorReply(404, 'unknown_asset', `${assetCode} is not a stake asset`, ctx.requestId)
+      }
+      // Refused before policy and before pricing — see the same check on the quote route.
+      if (!asset.enabled) {
+        return errorReply(
+          409,
+          'asset_disabled',
+          asset.blockedReason ?? `${assetCode} is not currently accepted`,
+          ctx.requestId,
+        )
+      }
+
+      // The same fail-closed policy gate the wallet path runs, in the same order, for the same
+      // reason. A custodial stake is not a smaller act than a wallet stake.
+      const verdict = await deps.policy.evaluateStake({
+        subject,
+        marketId: id,
+        amount: amount.toString(),
+        correlationId: ctx.requestId,
+      })
+      deps.metrics.increment('foresight_custodial_stakes_total', {
+        outcome: verdict.degraded ? 'policy_degraded' : verdict.decision === 'deny' ? 'denied' : 'taken',
+      })
+      if (verdict.degraded) {
+        return errorReply(
+          503,
+          'policy_unavailable',
+          'staking is temporarily unavailable because the policy service could not be reached; retry shortly',
+          ctx.requestId,
+        )
+      }
+      if (verdict.decision === 'deny') {
+        return errorReply(403, 'policy_denied', verdict.reasons.join(', ') || 'refused by policy', ctx.requestId)
+      }
+
+      const rates = await deps.pricing.stakeRates(assetCode)
+      const quote = quoteStake({ asset, stakeAmount: amount, rates })
+
+      const stake = await withOutbox(deps.sql, deps.producer, async (tx) =>
+        acceptStake(tx, {
+          marketId: id,
+          subject,
+          outcome,
+          quote,
+          platformAddress: custodialAddress,
+          idempotencyKey: key,
+        }),
+      )
+
+      // The ledger is what refuses a stake larger than the balance — its overdraft trigger, on the
+      // account that actually holds the number. A balance check here would be a second opinion
+      // read a moment earlier, and the window between the two is the overdraft.
+      let entry
+      try {
+        entry = await deps.ledger.postEntry({
+          kind: 'market_escrow',
+          actor: subject,
+          correlationId: ctx.requestId,
+          idempotencyKey: stakeIdempotencyKey(stake.id, 'escrow'),
+          description: `Foresight stake on market ${id}`.slice(0, 200),
+          postings: escrowPostings(stake),
+        })
+      } catch (err) {
+        // ────────────────────────────────────────────────────────────────────────────────────
+        // **A REFUSAL AND A SILENCE ARE OPPOSITE FACTS AND MUST NOT SHARE A PATH.**
+        //
+        // `LedgerRefusedError` is a 4xx: the ledger LOOKED at the entry and declined it, so no
+        // money moved and this stake never happened. The row must go, because leaving it would
+        // leave the idempotency key claimed — and a retry would then REPLAY a stake that does not
+        // exist, telling the user they hold a position nobody ever took.
+        //
+        // `LedgerUnavailableError` is everything else, and there the row must STAY: we do not know
+        // whether the entry posted, and the only safe answer is a retry on the same key. Deleting
+        // here would free the key and let a second entry post against the same money.
+        // ────────────────────────────────────────────────────────────────────────────────────
+        if (err instanceof LedgerRefusedError) {
+          await deps.sql`delete from custodial_stakes where id = ${stake.id} and state = 'accepted'`
+        }
+        throw err
+      }
+      const recorded = await recordEscrowEntry(deps.sql, stake.id, entry.id)
+
+      return {
+        status: 201,
+        body: {
+          stake: stakeSummary(recorded),
+          quote: quoteView(quote),
+          disclosure: stakeDisclosure(),
+        },
+      }
+    }),
+
+    /** One user's custodial position in a market. In the pool's unit, which is what they are paid in. */
+    define('GET', '/markets/:id/custodial-position', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const id = uuidParam(ctx, 'id')
+      const position = await custodialPositionOf(deps.sql, id, subjectOf(principal))
+      return {
+        status: 200,
+        body: {
+          marketId: id,
+          // EMBER, on both sides, whatever was brought to buy it. This is the number that decides
+          // a payout and it is the number the user is shown — see `stakeassets.ts` on why a
+          // BTC-denominated position would be an FX guarantee nobody wrote.
+          asset: POOL_ASSET,
+          yes: position.yes.toString(),
+          no: position.no.toString(),
+          disclosure: stakeDisclosure(),
         },
       }
     }),
@@ -1018,6 +1347,39 @@ function operatorOf(principal: Principal): string {
     throw new ForbiddenError('operator')
   }
   return `operator:${principal.userId}`
+}
+
+/**
+ * What a stake looks like from outside.
+ *
+ * Both amounts and BOTH rates, always together. A response that carried the pool share without the
+ * stake amount and the two rates would be a number the user could not check, and the whole point
+ * of recording three values on the row is that the arithmetic is theirs to re-run.
+ */
+function stakeSummary(stake: {
+  readonly id: string
+  readonly marketId: string
+  readonly outcome: number
+  readonly stakeAssetCode: string
+  readonly stakeAmount: bigint
+  readonly poolAmount: bigint
+  readonly rates: { readonly stakeUsdScaled: bigint; readonly poolUsdScaled: bigint }
+  readonly state: string
+  readonly createdAt: Date
+}): Record<string, unknown> {
+  return {
+    id: stake.id,
+    marketId: stake.marketId,
+    outcome: stake.outcome,
+    stakeAsset: stake.stakeAssetCode,
+    stakeAmount: stake.stakeAmount.toString(),
+    poolAsset: POOL_ASSET,
+    poolAmount: stake.poolAmount.toString(),
+    stakeRateUsdScaled: stake.rates.stakeUsdScaled.toString(),
+    poolRateUsdScaled: stake.rates.poolUsdScaled.toString(),
+    state: stake.state,
+    createdAt: stake.createdAt.toISOString(),
+  }
 }
 
 function subjectOf(principal: Principal): string {

@@ -730,6 +730,283 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function house_seeds_daily_ceiling();
     `,
   },
+  {
+    version: 9,
+    name: 'stake_assets',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- WHAT A BETTOR MAY BRING. An allowlist, refusing by default.
+      --
+      -- 29 §4.3 argues this shape for token DEPOSITS and the argument is the same one here: an
+      -- asset the platform accepts is an asset the platform must be able to price, hold, sweep,
+      -- reconcile and hand back. Three of those five live in repositories this service does not
+      -- own, so "the code could handle it" and "an operator has turned it on" are different
+      -- facts and this table is the second one.
+      --
+      -- The registry is also the ONLY place an asset's decimals are stated for a token. EMBER is
+      -- 18, BTC and LTC are 8, USDT-on-Ethereum is 6; treating one as another is a balance wrong
+      -- by ten orders of magnitude, and it is wrong silently.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create table if not exists stake_assets (
+        asset_code     text        primary key,
+        decimals       integer     not null,
+        display_name   text        not null,
+        enabled        boolean     not null default false,
+        -- Why it is off. Served to the client, so a disabled asset is a sentence and not a gap.
+        blocked_reason text,
+        created_at     timestamptz not null default now(),
+        updated_at     timestamptz not null default now(),
+
+        -- ── A RETIRED ASSET CAN NEVER BE STAKED. contracts/packages/chain names SHARD in
+        --    RETIRED_ASSETS; 'IssuableAssetCode' makes it a compile error in this repository and
+        --    ledger's migration 13 trigger refuses an acquisition denominated in it. This is the
+        --    third statement, and it is the one that holds against a row inserted by hand.
+        constraint stake_assets_not_retired check (asset_code <> 'SHARD'),
+
+        -- Either a chain asset code in upper case, or a TOKEN: urn naming chain, network and
+        -- contract. 29 §4 — two deployments of one brand are two assets, permanently, because
+        -- USDT is 6 decimals on Ethereum and 18 on BSC and a single code would have to pick one.
+        constraint stake_assets_code_shape check (
+          asset_code ~ '^[A-Z]{2,10}$'
+          or asset_code ~ '^TOKEN:[a-z0-9]+:[a-z0-9]+:0x[0-9a-f]{40}$'
+        ),
+
+        constraint stake_assets_decimals_plausible check (decimals >= 0 and decimals <= 36),
+
+        -- ── AN ASSET IS ON, OR IT SAYS WHY IT IS OFF. A disabled row with no reason is the shape
+        --    of an operator switching something off in a hurry and nobody being able to say what
+        --    is missing six weeks later.
+        constraint stake_assets_disabled_has_reason check (enabled or blocked_reason is not null),
+        constraint stake_assets_enabled_has_no_reason check (not enabled or blocked_reason is null)
+      );
+
+      -- ── The seed. Everything the owner named, plus the pool asset itself.
+      --
+      -- BTC and ETH are ON: both are in contracts-chain's ON_CHAIN_ASSETS, so micro-pricing
+      -- derives a market rate for each (pricing/src/rates.ts:57-58) and micro-ledger already
+      -- supervises balances in them.
+      --
+      -- LTC and USDT-on-Ethereum are OFF, and the reasons are specific rather than cautious:
+      --
+      --   LTC   contracts-chain describes the chain (CHAINS.LTC, 12 confirmations) but LTC is
+      --         deliberately absent from ON_CHAIN_ASSETS, whose own comment sets the order:
+      --         follower, addresses and sweep first, then a price source, then the member in a
+      --         release carrying a ledger migration. micro-pricing therefore has no LTC rate, and
+      --         this service fails closed on an unreadable rate rather than guessing one.
+      --
+      --   USDT  micro-pricing quotes a closed set of AssetCodes and does not answer for a TOKEN:
+      --         urn at all, so there is no rate to record. A stablecoin's rate is NOT assumed to
+      --         be one dollar: USDT has traded off its peg, and an assumed peg is an administered
+      --         rate with nobody's name on it.
+      --
+      -- Turning either on is an UPDATE to this row once its blocker is gone — not a code change.
+      insert into stake_assets (asset_code, decimals, display_name, enabled, blocked_reason)
+      values
+        ('EMBER', 18, 'EMBER', true, null),
+        ('BTC',    8, 'Bitcoin', true, null),
+        ('ETH',   18, 'Ethereum', true, null),
+        ('LTC',    8, 'Litecoin', false,
+         'micro-pricing publishes no LTC rate: LTC is not in contracts-chain ON_CHAIN_ASSETS, from which pricing derives MARKET_ASSETS. A stake cannot be priced in an asset the estate cannot quote.'),
+        ('TOKEN:eth:mainnet:0xdac17f958d2ee523a2206206994597c13d831ec7', 6, 'Tether USD (Ethereum)', false,
+         'micro-pricing quotes AssetCodes only and has no route for a TOKEN: urn. The peg is not assumed to be one dollar — an assumed peg is an administered rate with nobody''s name on it.')
+      on conflict (asset_code) do nothing;
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- A CUSTODIAL STAKE, AND THE THREE NUMBERS THAT MAKE IT RECONSTRUCTABLE.
+      --
+      -- The money that a user can lose must not depend on a rate nobody can audit. So the row
+      -- carries the amount TAKEN, the pool share GIVEN, and BOTH published rates that turned one
+      -- into the other — micro-billing's discipline (purchases.rate_usd_scaled, billing
+      -- migration 11) with a second rate column, because billing's pair has USD as the numeraire
+      -- and closes with one rate, whereas (BTC, EMBER) has no published cross rate and closes
+      -- only with both legs. An auditor can re-run the arithmetic AND check each leg against
+      -- pricing's own history.
+      --
+      -- **THE REFUND READS stake_amount. IT DOES NOT RE-DERIVE IT.** The forward conversion
+      -- floors; re-deriving would floor a second time and hand back strictly less than was taken,
+      -- silently, in the platform's favour. That is why stake_amount is a stored column.
+      --
+      -- The pool share is EMBER wei because the pool is the contract's own balance and there is
+      -- nowhere in uint256[2] public pool to put an asset code
+      -- (src/contracts/ForesightMarket.sol:123). See src/stakeassets.ts for the whole argument.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create table if not exists custodial_stakes (
+        id                    uuid          primary key default gen_random_uuid(),
+        market_id             uuid          not null references markets (id) on delete cascade,
+
+        -- The ledger's account subject, 'user:<uuid>'. Not an address: a custodial staker has no
+        -- key here, which is the whole point — custody's SIGNABLE_PURPOSES was not widened.
+        subject               text          not null,
+        outcome               smallint      not null,
+
+        -- What the user brought, and in what.
+        stake_asset_code      text          not null references stake_assets (asset_code),
+        stake_amount          numeric(78,0) not null,
+
+        -- The share of the one pool it bought, in EMBER wei.
+        pool_amount           numeric(78,0) not null,
+
+        -- The two published mid-market rates, USD per whole unit, at contracts-chain RATE_SCALE.
+        stake_rate_usd_scaled numeric(78,0) not null,
+        pool_rate_usd_scaled  numeric(78,0) not null,
+
+        -- The published platform address the aggregate is staked from on chain. Stored per row so
+        -- that rotating the address later cannot orphan the reconciliation of older stakes.
+        platform_address      text          not null,
+
+        state                 text          not null default 'accepted',
+
+        -- The ledger entry that moved the user's money, and the chain transaction that put the
+        -- pool share in the contract. Both nullable until they exist; the CHECKs below say when.
+        escrow_entry_id       text,
+        settle_entry_id       text,
+        tx_hash               text,
+
+        -- The client's key. A retry after a lost response must replay, never take a second stake.
+        idempotency_key       text          not null,
+
+        created_at            timestamptz   not null default now(),
+        staked_at             timestamptz,
+        resolved_at           timestamptz,
+        updated_at            timestamptz   not null default now(),
+
+        constraint custodial_stakes_outcome_ck check (outcome in (0,1)),
+
+        -- ── NOTHING HERE MAY BE ZERO. 'BigInt("") === 0n', and a zero stake with a positive pool
+        --    share is free money while a positive stake with a zero share is a confiscation.
+        constraint custodial_stakes_amounts_positive check (stake_amount > 0 and pool_amount > 0),
+        constraint custodial_stakes_rates_positive check (
+          stake_rate_usd_scaled > 0 and pool_rate_usd_scaled > 0
+        ),
+
+        -- ── STAKING THE POOL ASSET IS THE IDENTITY, NOT A CONVERSION. An EMBER stake that
+        --    recorded a different pool share would mean the platform applied a rate to an asset
+        --    against itself, which is a spread taken without saying so.
+        constraint custodial_stakes_pool_asset_is_identity check (
+          stake_asset_code <> 'EMBER'
+          or (stake_amount = pool_amount and stake_rate_usd_scaled = pool_rate_usd_scaled)
+        ),
+
+        constraint custodial_stakes_state_ck check (
+          state in ('accepted','staked','settled','refunded')
+        ),
+
+        -- ── A STAKE THAT IS IN THE POOL SAYS WHICH TRANSACTION PUT IT THERE. 'staked' with no
+        --    hash is a claim about the chain with no evidence, and it is the state a reconciler
+        --    would silently believe.
+        constraint custodial_stakes_staked_has_evidence check (
+          state not in ('staked','settled') or (tx_hash is not null and staked_at is not null)
+        ),
+        constraint custodial_stakes_terminal_has_time check (
+          state not in ('settled','refunded') or resolved_at is not null
+        ),
+        -- A refund is a refusal to have taken the money; it can only precede the chain stake.
+        constraint custodial_stakes_refund_never_staked check (
+          state <> 'refunded' or tx_hash is null
+        ),
+        constraint custodial_stakes_address_shape check (platform_address ~ '^0x[0-9a-f]{40}$'),
+        constraint custodial_stakes_subject_shape check (subject ~ '^user:[0-9a-f-]{36}$')
+      );
+
+      -- ── ONE KEY IS ONE STAKE, FOR EVER. The retry-after-a-lost-response case is the one that
+      --    takes a stranger's money twice, and it is the one nobody reproduces by hand.
+      create unique index if not exists custodial_stakes_idempotency_uniq
+        on custodial_stakes (idempotency_key);
+
+      create index if not exists custodial_stakes_market_idx
+        on custodial_stakes (market_id, outcome) where state in ('accepted','staked','settled');
+      create index if not exists custodial_stakes_subject_idx
+        on custodial_stakes (subject, created_at desc);
+      -- The broadcaster's queue: accepted but not yet in the pool.
+      create index if not exists custodial_stakes_pending_idx
+        on custodial_stakes (created_at) where state = 'accepted';
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- A STAKE AFTER CLOSE IS UNREPRESENTABLE, AND SO IS A STAKE IN A DISABLED ASSET.
+      --
+      -- The contract already refuses a late stake by itself (stake() reverts on
+      -- block.timestamp >= closeTime), and that is what protects the SELF-CUSTODY path. A
+      -- custodial stake never touches the contract at the moment it is taken — the platform's
+      -- broadcast happens afterwards — so nothing on chain stands between a late request and a
+      -- user's money. This trigger is that missing refusal, in the place it cannot be edited out.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create or replace function custodial_stakes_only_while_open() returns trigger
+        language plpgsql
+      as $$
+      declare
+        market_status text;
+        market_close  timestamptz;
+        asset_enabled boolean;
+      begin
+        select status, close_time into market_status, market_close
+          from markets where id = new.market_id;
+        if market_status is null then
+          raise exception 'stake names market %, which does not exist', new.market_id
+            using errcode = 'foreign_key_violation';
+        end if;
+        if market_status <> 'open' then
+          raise exception 'a stake is only taken while the market is open; this one is %', market_status
+            using errcode = 'check_violation';
+        end if;
+        if market_close <= now() then
+          raise exception 'this market reached its close time at %; the contract would refuse the stake and so does this', market_close
+            using errcode = 'check_violation';
+        end if;
+        select enabled into asset_enabled from stake_assets where asset_code = new.stake_asset_code;
+        if not asset_enabled then
+          raise exception '% is not an asset this platform currently accepts a stake in', new.stake_asset_code
+            using errcode = 'check_violation';
+        end if;
+        if new.state <> 'accepted' then
+          raise exception 'a stake is born accepted; staked, settled and refunded are transitions'
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists custodial_stakes_only_while_open on custodial_stakes;
+      create trigger custodial_stakes_only_while_open
+        before insert on custodial_stakes
+        for each row execute function custodial_stakes_only_while_open();
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- THE MONEY AND THE RATE THAT PRICED IT ARE IMMUTABLE.
+      --
+      -- The row IS the audit record — it is what makes the arithmetic reconstructable and what a
+      -- refund is paid from. A path that could edit the amount or the rate after the fact could
+      -- restate what a user staked, after they staked it, and no later reconciliation would have
+      -- anything to compare against.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create or replace function custodial_stakes_money_is_immutable() returns trigger
+        language plpgsql
+      as $$
+      begin
+        if new.stake_asset_code is distinct from old.stake_asset_code
+           or new.stake_amount is distinct from old.stake_amount
+           or new.pool_amount is distinct from old.pool_amount
+           or new.stake_rate_usd_scaled is distinct from old.stake_rate_usd_scaled
+           or new.pool_rate_usd_scaled is distinct from old.pool_rate_usd_scaled
+           or new.subject is distinct from old.subject
+           or new.outcome is distinct from old.outcome
+           or new.market_id is distinct from old.market_id then
+          raise exception 'a recorded stake is immutable: it is what a refund is paid from and what makes the rate auditable'
+            using errcode = 'check_violation';
+        end if;
+        if old.state in ('settled','refunded') and new.state is distinct from old.state then
+          raise exception 'a % stake is terminal', old.state
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists custodial_stakes_money_is_immutable on custodial_stakes;
+      create trigger custodial_stakes_money_is_immutable
+        before update on custodial_stakes
+        for each row execute function custodial_stakes_money_is_immutable();
+    `,
+  },
 ]
 
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)
@@ -742,6 +1019,7 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, for the test harness's truncate. Order is child-first. */
 export const TABLES: readonly string[] = Object.freeze([
+  'custodial_stakes',
   'house_seeds',
   'fee_reports',
   'resolutions',

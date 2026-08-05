@@ -85,6 +85,7 @@ import { httpCustodyClient, type CustodyClient } from './custodyclient.ts'
 import { httpIndexerClient, type IndexerClient } from './indexerclient.ts'
 import { httpLedgerClient, type LedgerClient } from './ledgerclient.ts'
 import { httpPolicyClient, type PolicyClient } from './policyclient.ts'
+import { httpPricingClient, type PricingClient } from './pricingclient.ts'
 // TYPE-ONLY, and that matters. `./env.ts` validates the process environment at import and calls
 // `process.exit(1)` when it is incomplete, so a value import here would make this module — and
 // therefore every test of the wiring in it — impossible to load without a full environment. That is
@@ -100,6 +101,7 @@ export type UpstreamEnv = Pick<
   | 'custodyUrl'
   | 'indexerUrl'
   | 'ledgerUrl'
+  | 'pricingUrl'
   | 'policyUrl'
   | 'adminApiUrl'
   | 'upstreamDeadlineMs'
@@ -132,6 +134,13 @@ export interface Upstreams {
   readonly custody: CustodyClient
   readonly indexer: IndexerClient
   readonly ledger: LedgerClient
+  /**
+   * The rate board. **Built with the plain `fetch`, not the authorised one**: `/rates/:asset` is
+   * unauthenticated by design (`pricing/src/server.ts:9`), and presenting a service token to a
+   * public endpoint would make this call fail whenever the credential was unavailable — coupling
+   * a stake's price to an authentication path it does not need.
+   */
+  readonly pricing: PricingClient
   readonly policy: PolicyClient
   /** `null` when `ADMIN_API_URL` is unset, which is a supported mode — see `index.ts`. */
   readonly engagementPolicies: EngagementPolicyClient | null
@@ -191,6 +200,14 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions): Upst
       deadlineMs: env.upstreamDeadlineMs,
       originatingService: options.originatingService,
       ...common,
+    }),
+    pricing: httpPricingClient({
+      baseUrl: env.pricingUrl,
+      deadlineMs: env.upstreamDeadlineMs,
+      // Deliberately NOT `...common` — no token. See the field's comment: the rate board is public,
+      // and making a stake's price depend on a credential it does not need would refuse stakes
+      // whenever identity was having a bad minute.
+      ...(options.fetch ? { fetch: options.fetch } : {}),
     }),
     policy: httpPolicyClient({
       baseUrl: env.policyUrl,

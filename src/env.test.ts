@@ -24,6 +24,7 @@ const MINIMAL: Readonly<Record<string, string>> = Object.freeze({
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4008',
   LEDGER_URL: 'http://127.0.0.1:4007',
+  PRICING_URL: 'http://127.0.0.1:4005',
   POLICY_URL: 'http://127.0.0.1:4006',
   // NEITHER credential appears here, and that is the point of the block below: this service must
   // boot without one, because `foresight-migrate` shares this environment and dials nothing.
