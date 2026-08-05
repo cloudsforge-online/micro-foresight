@@ -24,6 +24,12 @@
 
 import { hostname } from 'node:os'
 import type { Network } from '@cloudsforge/contracts-chain'
+import {
+  SecretError,
+  assertGeneratedSecret,
+  assertOpaqueSecret,
+  assertServiceCredential,
+} from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -41,21 +47,21 @@ export class EnvError extends Error {
 }
 
 /**
- * Values that must never be accepted. The list holds the strings that actually appear in this
- * repository's own `.env.example`, because those are the ones that get copied into a deployment by
- * someone in a hurry.
+ * THE `PLACEHOLDERS` SET THAT USED TO BE HERE IS GONE, AND ITS ABSENCE IS THE FIX.
+ *
+ * It held nine exact strings and was paired with a 24-character floor. Neither could fail for the
+ * value that actually reached 44 containers on both networks: micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` is 40 characters and was on nobody's list. The
+ * docblock that used to sit on `optionalSecret` below said as much in its own words — the estate
+ * defaults several of these to `estate-placeholder-token-0000000000000000`, "long enough to pass a
+ * length check" — and then kept the length check anyway. A check that cannot fail is worse than no
+ * check, because the absence of an alarm gets read as the absence of a problem.
+ *
+ * A deny-list of exact strings is structurally unable to work: the next placeholder somebody
+ * writes is, by definition, not on it. `@cloudsforge/secrets` asserts the SHAPE of a generated
+ * value instead, which is the property a placeholder cannot have. It is imported rather than
+ * copied so that this service cannot drift from the other sixteen.
  */
-const PLACEHOLDERS = new Set([
-  'change_me',
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -65,33 +71,91 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and
+ * the command that fixes it, and it never contains the value.
+ */
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+}
+
+/**
+ * The estate's shared event-bus HMAC key — one key behind every service-to-service POST.
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. The old `minLength` parameter is gone rather
+ * than kept in front: it is a strict subset of the shape check, and running it first answers a
+ * 40-character placeholder with "must be at least 24 characters" — true, useless, and about the
+ * wrong property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertGeneratedSecret(name, value))
   return value
 }
 
 /**
- * A secret that may be absent, but which must be a real one when present.
+ * A SERVICE CREDENTIAL that may be absent, but must be real if present.
+ *
+ * ── ABSENCE IS A SUPPORTED MODE, AND IT STAYS ONE ──────────────────────────────────────────────
  *
  * `null` rather than `undefined`, so "this deployment has none" is a value a caller must handle
- * rather than a property it can forget to read. The placeholder and length checks are `requiredSecret`'s
- * verbatim: an optional secret that is present is exactly as dangerous as a mandatory one when it is
- * the string `placeholder`, and the estate's compose files default several of these to
- * `estate-placeholder-token-0000000000000000` — long enough to pass a length check, which is why the
- * placeholder list matters more here than the length does.
+ * rather than a property it can forget to read. The empty check stays AHEAD of the assertion,
+ * because compose interpolates `${FORESIGHT_IDENTITY_CREDENTIAL:-}` and an unset credential arrives
+ * as the EMPTY STRING — that is the supported mode, not a malformed one. `migrator.ts` shares this
+ * environment and dials nobody, so turning the gap into `exit(1)` would fail the migration every
+ * deploy starts with.
+ *
+ * What is not supported is a value that is present and rubbish: a 20-character placeholder is a
+ * deployment that believes it HAS a credential, and its LEASED BACKGROUND JOBS then fail on a 401
+ * indistinguishable from custody being down — a market approved after the bootstrap sits in
+ * `awaiting_funds` forever with nothing in any log naming the cause.
+ *
+ * ── WHY NOT `assertGeneratedSecret` ────────────────────────────────────────────────────────────
+ *
+ * Because it would refuse every credential this estate has ever minted, and foresight would exit 1
+ * at boot on BOTH networks. A credential is `cfsc_` + base64url, which is neither wholly base64 nor
+ * wholly hex — the underscore in its own prefix disqualifies it. Measured live: the testnet
+ * credential also CONTAINS A HYPHEN while the mainnet one does not, so the "no hyphens" instinct
+ * that is correct for the signing key above would have booted mainnet and killed testnet.
  */
-function optionalSecret(source: Source, name: string): string | null {
+function optionalCredential(source: Source, name: string): string | null {
   const value = source[name]?.trim()
   if (!value) return null
-  return requiredSecret(source, name)
+  asEnvError(() => assertServiceCredential(name, value))
+  return value
+}
+
+/**
+ * A secret THIS ESTATE DID NOT GENERATE, and may be absent.
+ *
+ * `FORESIGHT_PROPOSER_TOKEN` and `FORESIGHT_SEARCH_TOKEN` authenticate to an external model
+ * provider and an external search adapter. **Their alphabets belong to their issuers**, so
+ * `assertGeneratedSecret` is the wrong rule twice over: it would refuse a working vendor key that
+ * happens to contain a `!` or a `-`, and a guard that refuses correct input is a guard an operator
+ * deletes at 3am. `assertOpaqueSecret` keeps the checks that ARE alphabet-independent — the
+ * placeholder markers, a JWT refused by name, a 16-character floor and a low entropy floor that
+ * catches `0000…` — and drops the ones that would be this service grading somebody else's RNG.
+ *
+ * ABSENT IS A SUPPORTED MODE AND STAYS ONE: unconfigured is how every deployment currently runs,
+ * the pipeline records "no proposals", and `undefined` is preserved rather than becoming `''`
+ * because `proposer.ts` chooses whether to send an `Authorization` header on exactly that
+ * distinction (`...(options.searchToken ? { token: … } : {})`).
+ */
+function optionalOpaqueSecret(source: Source, name: string): string | undefined {
+  const value = source[name]?.trim()
+  if (!value) return undefined
+  asEnvError(() => assertOpaqueSecret(name, value))
+  return value
 }
 
 function optional(source: Source, name: string, fallback: string): string {
@@ -257,7 +321,7 @@ export interface Env {
    * per-token jitter, shares one in-flight exchange, and on a 401 discards exactly the rejected
    * token and replays once. `src/upstreams.ts` carries the argument; this field is the input.
    *
-   * **Not `requiredSecret`, for ledger's reason and one of our own.** `migrator.ts` shares this
+   * **NOT REQUIRED, for ledger's reason and one of our own.** `migrator.ts` shares this
    * environment and `foresight-migrate` is given no credential — it dials nothing. And the estate's
    * deploy does not set this variable yet (it sets the token), so making it mandatory would refuse
    * to boot a service that is currently running. The absence is not silent: `index.ts` says so at
@@ -297,6 +361,33 @@ export interface Env {
    * moment this ships — `micro-deploy` sets `FORESIGHT_SERVICE_TOKEN` and does not yet pass
    * `FORESIGHT_IDENTITY_CREDENTIAL`, which its bootstrap already mints. **Delete this field once
    * the deploy passes the credential**; it is a migration aid with a stated end, not a mode.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **IT IS GUARDED BY `assertServiceCredential`, WHICH REFUSES A JWT BY NAME — micro-org #222.**
+   *
+   * Measured live on 2026-08-05: the value in this variable on the running estate is an **805-byte
+   * JWT that expired 26 hours before it was read**, on a container reporting healthy. The compose
+   * default when nothing is exported is `estate-placeholder-token-0000000000000000`, which is
+   * micro-org #142 wearing a different name. Both are refused, and both refusals are correct.
+   *
+   * **No JWT exemption is added and no weaker assertion is substituted**, because either would be
+   * this file agreeing that a ten-minute bearer read once at boot is an acceptable standing
+   * credential. It is not: that is the entire defect, and it is worse here than in most services
+   * because this one's custody calls come from LEASED BACKGROUND JOBS that a bootstrap outruns.
+   *
+   * The consequence, stated so nobody discovers it during a deploy: **a deployment that still sets
+   * `FORESIGHT_SERVICE_TOKEN` to a token will not boot** — neither `foresight` nor
+   * `foresight-migrate`. The remedy is the one this file has been describing for a release: stop
+   * passing the token, pass `FORESIGHT_IDENTITY_CREDENTIAL`, which `estate-bootstrap.sh` §5b has
+   * minted all along and which is sitting in `tokens.env` today.
+   *
+   * The remaining sharp edge is worth naming rather than hiding: a `cfsc_…` value pasted HERE now
+   * passes this guard and is then presented verbatim as a Bearer by `upstreams.ts`, which 401s all
+   * five upstreams — the compose file says so in as many words. The assertion narrows the accepted
+   * set to values that cannot work in this slot, which is the retirement #222 asks for done without
+   * deleting the field — and the field should be deleted, with `CredentialMode`'s `static` arm, in
+   * the follow-up that wallet has already made.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   readonly serviceToken: string | null
   readonly upstreamDeadlineMs: number
@@ -474,18 +565,21 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'FORESIGHT_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret: requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
     identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
-    identityCredential: optionalSecret(source, 'FORESIGHT_IDENTITY_CREDENTIAL'),
+    identityCredential: optionalCredential(source, 'FORESIGHT_IDENTITY_CREDENTIAL'),
 
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
     pricingUrl: optionalOrUndefined(source, 'PRICING_URL'),
     policyUrl: required(source, 'POLICY_URL'),
-    serviceToken: optionalSecret(source, 'FORESIGHT_SERVICE_TOKEN'),
+    // The SAME assertion as the credential above, deliberately. See the field docblock: this
+    // variable holds a JWT on the live estate and a JWT is what `assertServiceCredential` refuses
+    // by name. Pointing it at a weaker check would keep #222 open in the one file that can close it.
+    serviceToken: optionalCredential(source, 'FORESIGHT_SERVICE_TOKEN'),
     upstreamDeadlineMs: integer(source, 'FORESIGHT_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
 
     rpcUrls: jsonMap(source, 'FORESIGHT_RPC_URLS', '{}'),
@@ -523,10 +617,12 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     stuckMinutes: integer(source, 'FORESIGHT_STUCK_MINUTES', 30, 1, 1_440),
 
     proposerUrl: optionalOrUndefined(source, 'FORESIGHT_PROPOSER_URL'),
-    proposerToken: optionalOrUndefined(source, 'FORESIGHT_PROPOSER_TOKEN'),
+    // OPAQUE, not generated: an external model provider chose this value's alphabet. See
+    // `optionalOpaqueSecret`.
+    proposerToken: optionalOpaqueSecret(source, 'FORESIGHT_PROPOSER_TOKEN'),
     proposerModelId: optionalOrUndefined(source, 'FORESIGHT_PROPOSER_MODEL_ID'),
     searchUrl: optionalOrUndefined(source, 'FORESIGHT_SEARCH_URL'),
-    searchToken: optionalOrUndefined(source, 'FORESIGHT_SEARCH_TOKEN'),
+    searchToken: optionalOpaqueSecret(source, 'FORESIGHT_SEARCH_TOKEN'),
     proposerDeadlineMs: integer(source, 'FORESIGHT_PROPOSER_DEADLINE_MS', 30_000, 1_000, 120_000),
     proposerBatchSize: integer(source, 'FORESIGHT_PROPOSER_BATCH_SIZE', 5, 1, 25),
 

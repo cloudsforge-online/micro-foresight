@@ -30,19 +30,42 @@ jobs:
       port: 4021
       # The image startup smoke test boots the real service, and `env.ts` validates its
       # configuration at import — so the container needs the variables it declares, not just a
-      # database, or it exits before it serves /livez. These are CI-only NON-secrets: throwaway
-      # tokens that only have to clear a length check, URLs that are never dialled because /livez
-      # needs no upstream, and two all-zero addresses that only have to be twenty bytes of hex.
-      # Never a real credential, and never a real treasury.
+      # database, or it exits before it serves /livez. URLs that are never dialled because /livez
+      # needs no upstream, two all-zero addresses that only have to be twenty bytes of hex, and one
+      # GENERATED secret. Never a real credential, and never a real treasury.
+      #
+      # ── `=@generate`, AND WHY THE LITERALS THAT WERE HERE HAD TO GO ──────────────────────────
+      #
+      # This block used to say the tokens "only have to clear a length check". That sentence is the
+      # defect written into configuration: a length check is precisely what micro-org #142's
+      # 40-character placeholder cleared on 44 containers across both networks. `env.ts` now runs
+      # `@cloudsforge/secrets`, which asserts the SHAPE of a generated value and has no CI
+      # exemption on purpose — `ci-only-not-a-real-secret-…` normalises to a string containing both
+      # `cionly` and `notareal` and is refused twice over.
+      #
+      # CI does not need a WEAK secret, it needs A secret: nothing in the smoke test verifies a
+      # signature against anything else. `=@generate` asks the shared workflow for a fresh
+      # `openssl rand -base64 48` per run, which it throws away (micro-org `service-ci.yml`).
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-0000000000
+        OUTBOX_SIGNING_SECRET=@generate
         CUSTODY_URL=http://127.0.0.1:4005
         INDEXER_URL=http://127.0.0.1:4008
         LEDGER_URL=http://127.0.0.1:4007
         POLICY_URL=http://127.0.0.1:4006
-        FORESIGHT_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000
+        # `FORESIGHT_SERVICE_TOKEN` IS GONE FROM THIS BLOCK AND MUST NOT COME BACK.
+        #
+        # It was `ci-only-not-a-real-token-0000000000`, and `env.ts` now holds this variable to
+        # `assertServiceCredential` — which refuses that string on the marker check and refuses a
+        # JWT BY NAME. A JWT is what the live estate actually has in it (measured 2026-08-05: 805
+        # bytes, expired 26 hours, container healthy — micro-org #222), so a smoke test that fed
+        # this variable anything token-shaped would be smoke-testing the defect.
+        #
+        # `FORESIGHT_IDENTITY_CREDENTIAL` is deliberately absent too, for the reason `env.ts` gives
+        # for making it optional: the image must BOOT without one, and there is no `@generate` for
+        # a `cfsc_` credential because identity mints those against a row. Absence is the supported
+        # mode — `null`, `mode: none`, and `/livez` makes no outbound call.
         FORESIGHT_TREASURY_ADDRESS=0x0000000000000000000000000000000000000001
         FORESIGHT_ORACLE_ADDRESS=0x0000000000000000000000000000000000000002
         FORESIGHT_ORACLE_USER_ID=ci

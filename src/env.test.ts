@@ -5,6 +5,7 @@
  * process — which matters because the eager export in `env.ts` calls `process.exit(1)`.
  */
 
+import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
@@ -20,7 +21,14 @@ const MINIMAL: Readonly<Record<string, string>> = Object.freeze({
   FORESIGHT_DATABASE_URL: 'postgres://x:y@127.0.0.1:5432/foresight',
   IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
   IDENTITY_ISSUER: 'http://127.0.0.1:4001',
-  OUTBOX_SIGNING_SECRET: 'a-real-looking-secret-of-sufficient-length',
+  // GENERATED, not written. The literal that used to sit here was
+  // `a-real-looking-secret-of-sufficient-length` — 42 characters, therefore past the old
+  // 24-character floor, and a hyphenated placeholder of exactly the family that reached 44
+  // containers as micro-org #142. It also normalises to a string containing `sufficientlength`,
+  // which is on `@cloudsforge/secrets`' marker list BECAUSE OF THIS FIXTURE. Every test in this
+  // file was built on it, so the whole suite was asserting that a placeholder is an acceptable
+  // signing key for the estate's event bus.
+  OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4008',
   LEDGER_URL: 'http://127.0.0.1:4007',
@@ -34,6 +42,32 @@ const MINIMAL: Readonly<Record<string, string>> = Object.freeze({
 })
 
 for (const [key, value] of Object.entries(MINIMAL)) process.env[key] = value
+
+/**
+ * THIS FIXTURE CONTAINS HYPHENS ON PURPOSE, AND THAT IS THE MOST IMPORTANT THING ABOUT IT.
+ *
+ * A credential body is base64**url**, so `-` and `_` are in its alphabet. Measured on the running
+ * estates: the mainnet credential is alphanumeric and the testnet one CONTAINS A HYPHEN. So a
+ * "secrets have no hyphens" rule — which is correct for `OUTBOX_SIGNING_SECRET` above, and which
+ * every placeholder this estate wrote would have failed — passes mainnet and kills testnet at boot.
+ *
+ * Keeping a hyphenated credential here means that mistake fails CI instead of failing one estate in
+ * production. Do not "tidy" the hyphens out of this value.
+ *
+ * The literal it replaces was `cfsc_a-real-looking-credential-value`: the right prefix, a 30-
+ * character body, and therefore 22 BYTES of key material — under the floor and past the old
+ * 24-KEYSTROKE check. A fixture that could not survive the check it demonstrates documents the
+ * absence of one.
+ */
+const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
+
+/**
+ * The exact shape `FORESIGHT_SERVICE_TOKEN` holds on the live estate — measured 2026-08-05 as an
+ * 805-byte JWT that had expired 26 hours earlier while the container reported healthy. Fabricated
+ * here, obviously; only the first two segments matter, because the guard refuses on SHAPE and never
+ * decodes. micro-org #222.
+ */
+const JWT = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJmb3Jlc2lnaHQiLCJleHAiOjF9.notasignature'
 
 const { EnvError, SERVICE, env, loadEnv, parseNetwork } = await import('./env.ts')
 
@@ -71,8 +105,8 @@ test('BOTH credentials are optional, because the migrator shares this environmen
   assert.equal(none.identityCredential, null)
   assert.equal(none.serviceToken, null)
 
-  const exchanged = loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: 'cfsc_a-real-looking-credential-value' })
-  assert.equal(exchanged.identityCredential, 'cfsc_a-real-looking-credential-value')
+  const exchanged = loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: CREDENTIAL })
+  assert.equal(exchanged.identityCredential, CREDENTIAL)
 
   // And `IDENTITY_URL` defaults to the issuer, so this fix needs no new URL in any deploy manifest:
   // the issuer of a token is by definition where the token came from.
@@ -82,11 +116,24 @@ test('BOTH credentials are optional, because the migrator shares this environmen
 
 test('an optional secret that IS present is held to the same bar as a required one', () => {
   // The dangerous middle state. Optional must not mean unchecked: the estate's compose defaults
-  // these to `estate-placeholder-token-0000000000000000`, which is 41 characters and sails through
-  // a length check — so the placeholder list matters more here than the length does.
-  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: 'short' }), /at least 24/)
-  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: 'placeholder' }), /known placeholder/)
-  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_SERVICE_TOKEN: 'placeholder' }), /known placeholder/)
+  // BOTH of these to `estate-placeholder-token-0000000000000000`, which is 41 characters and sails
+  // through a length check.
+  //
+  // The two assertions below used to read `/at least 24/` and `/known placeholder/`. The first was
+  // a defence of the defective rule — it pinned a floor counted in KEYSTROKES, so any fix that
+  // started counting bytes would fail CI however much better it was — and the second pinned a
+  // deny-list message for a value the deny-list only happened to contain. What they assert now is
+  // the property: the variable is named, the value is not quoted back, and neither is accepted.
+  for (const name of ['FORESIGHT_IDENTITY_CREDENTIAL', 'FORESIGHT_SERVICE_TOKEN']) {
+    for (const bad of ['short', 'placeholder', 'estate-placeholder-token-0000000000000000']) {
+      assert.throws(
+        () => loadEnv({ ...MINIMAL, [name]: bad }),
+        (err: unknown) =>
+          err instanceof EnvError && err.message.includes(name) && !err.message.includes(bad),
+        `${name} accepted ${bad}`,
+      )
+    }
+  }
   // An empty string is ABSENT, not a bad secret: compose writes `VAR: ${VAR:-}` for an unset
   // variable, so this is the shape a real deployment produces and it must not fail the boot.
   assert.equal(loadEnv({ ...MINIMAL, FORESIGHT_IDENTITY_CREDENTIAL: '' }).identityCredential, null)
@@ -117,11 +164,93 @@ test('a known placeholder is refused outright, even when it is long enough', () 
     /known placeholder/,
   )
   for (const value of ['CHANGE_ME', 'change_me', 'changeme', 'placeholder']) {
-    assert.throws(() => loadEnv({ ...MINIMAL, OUTBOX_SIGNING_SECRET: value }), /known placeholder|at least 24/)
+    assert.throws(() => loadEnv({ ...MINIMAL, OUTBOX_SIGNING_SECRET: value }), /known placeholder/)
   }
-  // Length is a proxy for entropy and the only one available. It is set above the point at which a
-  // human-chosen string is plausible, so a memorable password fails too.
-  assert.throws(() => loadEnv({ ...MINIMAL, FORESIGHT_SERVICE_TOKEN: 'short' }), /at least 24/)
+  // AND THE ONE THAT ACTUALLY SHIPPED, which no deny-list contained. micro-org #142's
+  // `estate-only-outbox-secret-00000000000000` is 40 characters, so it cleared the 24-character
+  // floor this file used to assert, and it reached 44 containers on both networks with every guard
+  // in the estate passing it.
+  assert.throws(
+    () => loadEnv({ ...MINIMAL, OUTBOX_SIGNING_SECRET: 'estate-only-outbox-secret-00000000000000' }),
+    (err: unknown) => err instanceof EnvError && /placeholder/.test(err.message),
+  )
+  // BYTES, not keystrokes. This assertion used to read `/at least 24/` against
+  // `FORESIGHT_SERVICE_TOKEN: 'short'` — the keystroke floor that let the 40-character placeholder
+  // above through. `hunter2` is spelled in the base64 alphabet, so it is not the alphabet that
+  // catches it: it decodes to 5 bytes.
+  assert.throws(
+    () => loadEnv({ ...MINIMAL, OUTBOX_SIGNING_SECRET: 'hunter2' }),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /5 bytes of key material/.test(err.message) &&
+      /at least 32/.test(err.message) &&
+      !err.message.includes('hunter2'),
+  )
+})
+
+test('FORESIGHT_SERVICE_TOKEN CARRYING A JWT IS REFUSED BY NAME — micro-org #222', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // Measured on the running estate 2026-08-05: this variable held an 805-byte JWT that had expired
+  // 26 HOURS earlier, on a container reporting healthy. That value is what this assertion refuses.
+  //
+  // If this test is ever "fixed" by adding a JWT exemption or by dropping to a weaker assertion,
+  // the fix IS the defect: a ten-minute bearer read once at boot is precisely #197 and #222, and it
+  // bites this service harder than most because its custody calls come from leased background jobs
+  // that a bootstrap outruns.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  for (const name of ['FORESIGHT_SERVICE_TOKEN', 'FORESIGHT_IDENTITY_CREDENTIAL']) {
+    assert.throws(
+      () => loadEnv({ ...MINIMAL, [name]: JWT }),
+      (err: unknown) => {
+        assert.ok(err instanceof EnvError)
+        assert.match(err.message, new RegExp(name))
+        assert.match(err.message, /TOKEN, not a credential|micro-org#197/)
+        assert.ok(!err.message.includes(JWT), 'the error quoted the token back')
+        return true
+      },
+      `${name} accepted a JWT`,
+    )
+  }
+})
+
+/**
+ * THE PROPOSER AND SEARCH TOKENS ARE OPAQUE, AND THAT IS A DELIBERATE THIRD CLASS.
+ *
+ * They authenticate to an external model provider and an external search adapter, so their
+ * alphabets belong to their ISSUERS. Demanding base64 of a value somebody else minted refuses a
+ * correct credential, and a guard that refuses correct input is a guard an operator deletes.
+ */
+test('the proposer and search tokens take a vendor alphabet, and still refuse a placeholder', () => {
+  // Punctuation a generated-secret rule would reject, and an opaque rule must not.
+  // Punctuation and an underscore-prefixed shape a GENERATED-secret rule would reject outright.
+  // Deliberately not spelled like any real vendor's format, so the estate's secret-hygiene scan
+  // has nothing to match on.
+  const vendorKey = 'vendorkey_9f!Qz$4Kd7#Vh2Ls0Pw8Rt6Yb1Nm3Xc'
+  const env = loadEnv({
+    ...MINIMAL,
+    FORESIGHT_PROPOSER_TOKEN: vendorKey,
+    FORESIGHT_SEARCH_TOKEN: vendorKey,
+  })
+  assert.equal(env.proposerToken, vendorKey)
+  assert.equal(env.searchToken, vendorKey)
+
+  // Absent stays absent — `undefined`, not `''`, because `proposer.ts` sends an Authorization
+  // header on exactly that distinction.
+  assert.equal(loadEnv(MINIMAL).proposerToken, undefined)
+  assert.equal(loadEnv({ ...MINIMAL, FORESIGHT_SEARCH_TOKEN: '   ' }).searchToken, undefined)
+
+  // What survives when the alphabet check does not: the markers, which are what catch this
+  // estate's real defects, and a JWT — a ten-minute bearer in a variable read once at boot.
+  for (const name of ['FORESIGHT_PROPOSER_TOKEN', 'FORESIGHT_SEARCH_TOKEN']) {
+    for (const bad of ['estate-placeholder-token-0000000000000000', 'changeme', '0000000000000000000000', JWT]) {
+      assert.throws(
+        () => loadEnv({ ...MINIMAL, [name]: bad }),
+        (err: unknown) =>
+          err instanceof EnvError && err.message.includes(name) && !err.message.includes(bad),
+        `${name} accepted ${bad.slice(0, 20)}`,
+      )
+    }
+  }
 })
 
 /**
