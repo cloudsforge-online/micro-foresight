@@ -17,6 +17,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import postgres from 'postgres'
 import { migrate, type Sql } from '@cloudsforge/db'
+import { RATE_SCALE } from '@cloudsforge/contracts-chain'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
 import { MIGRATIONS, TABLES } from './migrations.ts'
 import { registerServiceMetrics } from './server.ts'
@@ -25,6 +26,14 @@ import { SeedPolicyUnavailableError, type EngagementPolicyClient, type SeedPolic
 import type { CustodyClient, SignRequest } from './custodyclient.ts'
 import type { ActivityItem, IndexerClient, TransactionView } from './indexerclient.ts'
 import type { PolicyClient, PolicyVerdict } from './policyclient.ts'
+import { RateUnavailableError, type PricingClient } from './pricingclient.ts'
+import {
+  LedgerRefusedError,
+  LedgerUnavailableError,
+  type EntryRequest,
+  type LedgerClient,
+  type PostedEntry,
+} from './ledgerclient.ts'
 import type { Proposer, ProposalRun } from './proposer.ts'
 import type { SourceProbe } from './resolve.ts'
 import type { JsonRpc } from './evm.ts'
@@ -330,6 +339,116 @@ export function fakePolicy(): FakePolicy {
 }
 
 export const HOUSE = '0x4444444444444444444444444444444444444444'
+
+/** The published platform address a custodial position is staked from. See `custodialstakes.ts`. */
+export const CUSTODIAL = '0x5555555555555555555555555555555555555555'
+
+/**
+ * Rates the tests choose, at contracts-chain's RATE_SCALE.
+ *
+ * BTC at $60,000 and EMBER at $0.25 are the numbers every arithmetic assertion in this repository
+ * is written against, so 0.01 BTC is $600 is 2,400 EMBER — a figure a reader can check in their
+ * head, which is the only reason a test's constants matter.
+ */
+export const BTC_USD_SCALED = 60_000_000_000n
+export const EMBER_USD_SCALED = 250_000n
+
+export interface FakePricing extends PricingClient {
+  setRate(asset: string, usdScaled: bigint): void
+  /** Make a leg unreadable. The fail-closed path is the point of the seam. */
+  setUnavailable(asset: string, unavailable: boolean): void
+  readonly reads: readonly string[]
+}
+
+export function fakePricing(): FakePricing {
+  const reads: string[] = []
+  const rates = new Map<string, bigint>([
+    ['BTC', BTC_USD_SCALED],
+    ['ETH', 3_000_000_000n],
+    ['EMBER', EMBER_USD_SCALED],
+  ])
+  const down = new Set<string>()
+  return {
+    reads,
+    setRate(asset, usdScaled) {
+      rates.set(asset, usdScaled)
+    },
+    setUnavailable(asset, unavailable) {
+      if (unavailable) down.add(asset)
+      else down.delete(asset)
+    },
+    async stakeRates(stakeAsset) {
+      reads.push(stakeAsset)
+      // The REAL client's shortcut, restated so the fake cannot be kinder than the thing it stands
+      // in for: staking the pool asset applies no rate, so no rate is read.
+      if (stakeAsset === 'EMBER') {
+        if (down.has('EMBER')) throw new RateUnavailableError('EMBER', 'the EMBER rate is not usable: test')
+        return { stakeUsdScaled: RATE_SCALE, poolUsdScaled: RATE_SCALE }
+      }
+      for (const asset of [stakeAsset, 'EMBER']) {
+        if (down.has(asset)) {
+          throw new RateUnavailableError(asset, `the ${asset} rate is not usable: test`)
+        }
+      }
+      const stakeUsdScaled = rates.get(stakeAsset)
+      const poolUsdScaled = rates.get('EMBER')
+      if (stakeUsdScaled === undefined || poolUsdScaled === undefined) {
+        throw new RateUnavailableError(stakeAsset, `no test rate for ${stakeAsset}`)
+      }
+      return { stakeUsdScaled, poolUsdScaled }
+    },
+  }
+}
+
+export interface FakeLedger extends LedgerClient {
+  /** Every entry this service tried to post, in order. The seam money is checked at. */
+  readonly entries: readonly EntryRequest[]
+  /** Refuse like the real ledger does when it has LOOKED and said no — an overdraft is this. */
+  setRefusal(refusal: { status: number; code: string; message: string } | null): void
+  /** Unreachable. We do not know whether the entry posted, so the caller must retry. */
+  setDown(down: boolean): void
+  /** Forget everything. A fake shared across a file's cases must be reset like the database is. */
+  reset(): void
+}
+
+export function fakeLedger(): FakeLedger {
+  const entries: EntryRequest[] = []
+  const posted = new Map<string, PostedEntry>()
+  let refusal: { status: number; code: string; message: string } | null = null
+  let down = false
+  return {
+    entries,
+    setRefusal(next) {
+      refusal = next
+    },
+    setDown(value) {
+      down = value
+    },
+    reset() {
+      entries.length = 0
+      posted.clear()
+      refusal = null
+      down = false
+    },
+    async postEntry(request) {
+      if (down) throw new LedgerUnavailableError('the ledger did not answer')
+      if (refusal) throw new LedgerRefusedError(refusal.status, refusal.code, refusal.message)
+      entries.push(request)
+      // Idempotent, like the real one. A retry on the same key replays rather than posting twice —
+      // a fake that posted twice would let a double-charge pass every test in this repository.
+      const already = posted.get(request.idempotencyKey)
+      if (already) return { ...already, replayed: true }
+      const entry: PostedEntry = {
+        id: `entry-${posted.size + 1}`,
+        kind: request.kind,
+        recordedAt: new Date().toISOString(),
+        replayed: false,
+      }
+      posted.set(request.idempotencyKey, entry)
+      return entry
+    },
+  }
+}
 
 export interface FakeSeedPolicyClient extends EngagementPolicyClient {
   /** The policy admin-api answers with; null is "no seed sizes raised". */

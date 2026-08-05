@@ -45,6 +45,8 @@ import {
   testMetrics,
   FUTURE,
   type FakePolicy,
+  fakeLedger,
+  fakePricing,
 } from './testsupport.ts'
 import { approveIdea } from './ideas.ts'
 
@@ -98,6 +100,12 @@ before(async () => {
     // The engagement programme is deliberately ABSENT here — houseseed.test.ts wires it. What
     // this file's suite proves about it is only that its absence changes nothing.
     houseAddress: undefined,
+    // Custodial staking is deliberately UNCONFIGURED in this file: what it proves about the
+    // feature is only that its absence changes nothing for a wallet stake. custodialstakes.test.ts
+    // wires it.
+    pricing: fakePricing(),
+    ledger: fakeLedger(),
+    custodialAddress: undefined,
     engagementPolicies: null,
   }
   server = createServer(deps)

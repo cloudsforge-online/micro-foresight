@@ -270,6 +270,7 @@ function upstreamsFor(w: World, credential: string | null, staticToken: string |
     serviceToken: staticToken,
     custodyUrl: CUSTODY,
     indexerUrl: 'http://indexer:4000',
+    pricingUrl: 'http://pricing.invalid',
     ledgerUrl: 'http://ledger:4000',
     policyUrl: 'http://policy:4000',
     adminApiUrl: undefined,
