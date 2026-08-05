@@ -193,11 +193,16 @@ lifecycle
   .addProbe(httpProbe('indexer', `${env.indexerUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('ledger', `${env.ledgerUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('policy', `${env.policyUrl}/livez`, { kind: 'soft' }))
-  // SOFT, like the others. Pricing being down stops a NON-EMBER stake being taken — the route
-  // refuses with `rate_unavailable` at the point of use — and stops nothing else this service does.
-  // A hard probe would take the whole service out of rotation for a feature most requests do not
-  // touch, which is the trade `ledger/src/upstreams.ts` declines for the same shape of dependency.
-  .addProbe(httpProbe('pricing', `${env.pricingUrl}/livez`, { kind: 'soft' }))
+  // SOFT, and only when there is one to probe. Pricing being down stops a NON-EMBER stake being
+  // taken — the route refuses with `rate_unavailable` at the point of use — and stops nothing else
+  // this service does. A hard probe would take the whole service out of rotation for a feature most
+  // requests do not touch, which is the trade `ledger/src/upstreams.ts` declines for the same shape
+  // of dependency. An UNSET url probed anyway would report `undefined/livez` unreachable for ever,
+  // which is a permanently amber readiness page saying nothing true.
+
+if (env.pricingUrl !== undefined) {
+  lifecycle.addProbe(httpProbe('pricing', `${env.pricingUrl}/livez`, { kind: 'soft' }))
+}
 
 // 7. The dependency bundles, built once and shared so the routes and the worker cannot disagree
 //    about which network they are on or which bounds they are enforcing.
