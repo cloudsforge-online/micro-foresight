@@ -61,6 +61,7 @@
  */
 
 import {
+  CHAINS,
   RATE_SCALE,
   chainSpec,
   isRetiredAsset,
@@ -165,13 +166,27 @@ export function parseStakeAssetCode(value: unknown): StakeAssetCode {
  * Built as a record so `parseStakeAssetCode` can answer "is this an asset the estate can name"
  * without a second list. `Object.hasOwn` on it is the membership test; the values are what stop
  * an 8-decimal amount being treated as an 18-decimal one, which is a factor of 10¹⁰.
+ *
+ * ── THE KEYS ARE DERIVED TOO, AND THEY DID NOT USED TO BE ─────────────────────────────────────
+ *
+ * This was `['EMBER', 'BTC', 'ETH', 'SOL', 'XRP', 'LTC', 'SHARD']` — the `AssetCode` union typed
+ * out by hand, with only the VALUES read from the package. That half-derivation looks safe and is
+ * not: a seventh asset added upstream would be absent here, `Object.hasOwn` would say no, and
+ * `parseStakeAssetCode` would refuse it as "not an asset this platform can name" — a stake refused
+ * for a reason that is not true, which is the exact defect migration 10 exists to repair one
+ * table over. Nothing would go red, because a list can only be checked against another list and
+ * there was no other list.
+ *
+ * `CHAINS` is `Readonly<Record<AssetCode, ChainSpec>>`, so its keys ARE the union. Widening it
+ * upstream now widens this, and a member removed upstream stops compiling here rather than
+ * lingering as a key nothing answers for. Retirement is still a separate question and is still
+ * asked separately, by `isRetiredAsset` in `parseStakeAssetCode`: SHARD is nameable and
+ * un-stakeable, and collapsing those two into one list is what put a retired asset in a decimals
+ * table in the first place.
  */
 const CHAIN_DECIMALS: Readonly<Record<string, number>> = Object.freeze(
   Object.fromEntries(
-    (['EMBER', 'BTC', 'ETH', 'SOL', 'XRP', 'LTC', 'SHARD'] as AssetCode[]).map((asset) => [
-      asset,
-      chainSpec(asset).decimals,
-    ]),
+    (Object.keys(CHAINS) as AssetCode[]).map((asset) => [asset, chainSpec(asset).decimals]),
   ),
 )
 

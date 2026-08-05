@@ -1007,6 +1007,79 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function custodial_stakes_money_is_immutable();
     `,
   },
+
+  {
+    version: 10,
+    name: 'litecoin_stake_asset_enabled',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- LITECOIN'S BLOCKER IS GONE, SO THE ROW STOPS SAYING IT IS THERE.
+      --
+      -- Migration 9 seeded LTC disabled and gave the reason: "micro-pricing publishes no LTC rate:
+      -- LTC is not in contracts-chain ON_CHAIN_ASSETS, from which pricing derives MARKET_ASSETS."
+      -- That was true when it was written. It is now false in every clause, and a refusal that
+      -- cites a condition somebody has since satisfied is worse than an unexplained one — the
+      -- reason is SERVED to the user (stakeassets.ts, blockedReason), so the platform was telling
+      -- a Litecoin holder to wait for something that had already happened.
+      --
+      -- ── THE FOUR PREREQUISITES, EACH CHECKED AGAINST THE THING ITSELF ────────────────────────
+      --
+      --   1. LTC is in ON_CHAIN_ASSETS   contracts/packages/chain/src/index.ts:360.
+      --   2. It has a real chain spec    CHAINS.LTC, same file :260-268 — bitcoin family, 8
+      --                                  decimals, 12 confirmations (NOT Bitcoin's 6: ~2.5-minute
+      --                                  blocks on a fraction of the hashrate). The 8 is what this
+      --                                  registry's own decimals column has to agree with, and does.
+      --   3. Pricing answers for it      MARKET_ASSETS is derived, not typed (pricing/src/rates.ts:57
+      --                                  filters ON_CHAIN_ASSETS), so membership alone makes it
+      --                                  quotable. Confirmed against the RUNNING service rather than
+      --                                  inferred from the derivation: GET /rates/LTC returns
+      --                                  usable=true, sourceCount=4, rateScale=1000000 — four venues
+      --                                  agreeing to 7 bps. The scale matters as much as the price:
+      --                                  pricingclient.ts refuses a rate published at any other.
+      --   4. The ledger supervises it    ledger migration 14 'litecoin_chain_asset' inserts LTC into
+      --                                  chain_assets, which is what makes a vacuous
+      --                                  'liability_sum' reconciliation ILLEGAL for it. Verified in
+      --                                  the live database, not only in the migration source.
+      --
+      -- USDT-on-Ethereum is deliberately NOT touched. Its recorded reason — pricing quotes
+      -- AssetCodes and has no route for a TOKEN: urn — is still true, and was re-checked the same
+      -- way: GET /rates/TOKEN:eth:mainnet:0xdac17f95… answers 404 not_found, "is not quoted by this
+      -- service". An asset the platform cannot price stays off.
+      --
+      -- ── WHY THIS IS A NEW MIGRATION AND NOT AN EDIT TO 9 ─────────────────────────────────────
+      --
+      -- Migration 9's own text promised this: "Turning either on is an UPDATE to this row once its
+      -- blocker is gone — not a code change." Editing the seed instead would have been the quiet
+      -- disaster: @cloudsforge/db checksums each migration (checksumOf, index.ts:113) and refuses a
+      -- run whose text changed after it was applied. Every local test would pass against a database
+      -- built from scratch, and the deploy would fail in the migrator against the live estate, which
+      -- already records version 9 with the old checksum. The fix for a wrong migration is always a
+      -- new migration.
+      --
+      -- ── BOTH COLUMNS, IN ONE STATEMENT ───────────────────────────────────────────────────────
+      --
+      -- 'blocked_reason' must go to NULL in the same UPDATE. 'stake_assets_enabled_has_no_reason'
+      -- (migration 9) refuses a row that is both on and carrying an excuse, so setting only
+      -- 'enabled' would raise 23514 and abort this migration — which is the constraint working. It
+      -- is also the point of it: a stale reason left on an enabled row is a sentence nobody reads
+      -- and nobody can trust, which is the defect being repaired here, one column over.
+      --
+      -- Idempotent by predicate rather than by ON CONFLICT: the WHERE clause makes a re-run against
+      -- a database where an operator already flipped the switch a no-op instead of an error, and
+      -- narrowing it to the exact stale reason means this migration cannot silently re-enable an
+      -- asset that a LATER operator turned off for a NEW reason. It would find no row and change
+      -- nothing, which is the correct behaviour for a one-shot job that has already done its work.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      update stake_assets
+         set enabled        = true,
+             blocked_reason = null,
+             updated_at     = now()
+       where asset_code = 'LTC'
+         and not enabled
+         and blocked_reason like 'micro-pricing publishes no LTC rate%';
+    `,
+  },
 ]
 
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)
