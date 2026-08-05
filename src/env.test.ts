@@ -24,7 +24,6 @@ const MINIMAL: Readonly<Record<string, string>> = Object.freeze({
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4008',
   LEDGER_URL: 'http://127.0.0.1:4007',
-  PRICING_URL: 'http://127.0.0.1:4005',
   POLICY_URL: 'http://127.0.0.1:4006',
   // NEITHER credential appears here, and that is the point of the block below: this service must
   // boot without one, because `foresight-migrate` shares this environment and dials nothing.
@@ -206,5 +205,30 @@ test('this service reads exactly one database variable, and it is its own', () =
     Object.values(env).some((value) => value === foreignDsn),
     false,
     'a foreign database URL was picked up',
+  )
+})
+
+test('PRICING_URL is optional, and its absence refuses a rate rather than defaulting one', async () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // The live estate does not set it (`deploy/compose/docker-compose.estate.yml`, the `foresight`
+  // service), so requiring it would refuse to boot a deployment that had been working. That is
+  // only safe because an absent rate source REFUSES rather than permits: there is nothing to
+  // guess from, and `unconfiguredPricingClient` says so with the reason.
+  //
+  // MUTATION: have the unconfigured client return `{ stakeUsdScaled: RATE_SCALE, poolUsdScaled:
+  // RATE_SCALE }` for every asset → every BTC stake is priced as if one satoshi were one dollar,
+  // and this reddens.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  const { unconfiguredPricingClient } = await import('./pricingclient.ts')
+  const client = unconfiguredPricingClient()
+
+  // The pool asset applies no rate at all, so it is unaffected — this is what lets the estate keep
+  // running unchanged while PRICING_URL is unset.
+  const ember = await client.stakeRates('EMBER')
+  assert.equal(ember.stakeUsdScaled, ember.poolUsdScaled)
+
+  await assert.rejects(
+    () => client.stakeRates('BTC'),
+    (err: unknown) => err instanceof Error && /no PRICING_URL/.test(err.message),
   )
 })

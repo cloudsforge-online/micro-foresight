@@ -175,3 +175,33 @@ export function httpPricingClient(options: PricingClientOptions): PricingClient 
     },
   }
 }
+
+/**
+ * The client for a deployment with no `PRICING_URL`.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **AN ABSENT RATE SOURCE IS NOT A PERMISSIVE ONE.** This refuses every rate read, with the reason,
+ * so a stake in an asset the platform cannot price is refused rather than priced at a default. It
+ * is the same shape as `micro-foresight`'s other optional peers — an unconfigured engagement
+ * programme refuses a seed rather than planning one of zero.
+ *
+ * The one thing it does NOT refuse is a stake in the pool asset, because that applies no rate at
+ * all. A deployment that never turned on a second asset therefore behaves exactly as it did before
+ * this existed, which is the property that lets `PRICING_URL` be absent in the live compose without
+ * the service refusing to boot.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function unconfiguredPricingClient(): PricingClient {
+  return {
+    async stakeRates(stakeAsset) {
+      if (stakeAsset === POOL_ASSET) {
+        return { stakeUsdScaled: RATE_SCALE, poolUsdScaled: RATE_SCALE }
+      }
+      throw new RateUnavailableError(
+        stakeAsset,
+        'this deployment has no PRICING_URL, so no rate can be read and a stake in ' +
+          `${stakeAsset} cannot be priced`,
+      )
+    },
+  }
+}

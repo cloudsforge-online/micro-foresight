@@ -244,12 +244,19 @@ export interface Env {
   readonly indexerUrl: string
   readonly ledgerUrl: string
   /**
-   * micro-pricing, for the two rates a non-EMBER stake is denominated by. **Required**, not
-   * optional: this service now takes stakes in assets whose value it cannot state without asking,
-   * and a deployment without a rate source would accept those stakes and price them at nothing.
+   * micro-pricing, for the two rates a non-EMBER stake is denominated by.
+   *
+   * **Absent is a supported mode, and it is the mode the estate is in today** — the compose does
+   * not set it (`deploy/compose/docker-compose.estate.yml`, the `foresight` service). Requiring it
+   * was the first instinct and it was wrong twice over: it would refuse to boot a deployment that
+   * had been working, and it would do so in the name of a safety property this service already has
+   * without it. With no rate source there is nothing to guess FROM — `unconfiguredPricingClient`
+   * refuses every rate read, so a non-EMBER stake answers 503 `rate_unavailable` and an EMBER
+   * stake, which applies no rate, is untouched. Fail-closed either way.
+   *
    * The rate board is public (`pricing/src/server.ts:9`), so no credential is presented.
    */
-  readonly pricingUrl: string
+  readonly pricingUrl: string | undefined
   readonly policyUrl: string
   /**
    * A pre-minted service token, kept ONLY as the bridge while the deploy still supplies one.
@@ -421,7 +428,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
-    pricingUrl: required(source, 'PRICING_URL'),
+    pricingUrl: optionalOrUndefined(source, 'PRICING_URL'),
     policyUrl: required(source, 'POLICY_URL'),
     serviceToken: optionalSecret(source, 'FORESIGHT_SERVICE_TOKEN'),
     upstreamDeadlineMs: integer(source, 'FORESIGHT_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),

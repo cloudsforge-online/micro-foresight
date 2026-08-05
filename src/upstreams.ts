@@ -85,7 +85,7 @@ import { httpCustodyClient, type CustodyClient } from './custodyclient.ts'
 import { httpIndexerClient, type IndexerClient } from './indexerclient.ts'
 import { httpLedgerClient, type LedgerClient } from './ledgerclient.ts'
 import { httpPolicyClient, type PolicyClient } from './policyclient.ts'
-import { httpPricingClient, type PricingClient } from './pricingclient.ts'
+import { httpPricingClient, unconfiguredPricingClient, type PricingClient } from './pricingclient.ts'
 // TYPE-ONLY, and that matters. `./env.ts` validates the process environment at import and calls
 // `process.exit(1)` when it is incomplete, so a value import here would make this module — and
 // therefore every test of the wiring in it — impossible to load without a full environment. That is
@@ -201,7 +201,12 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions): Upst
       originatingService: options.originatingService,
       ...common,
     }),
-    pricing: httpPricingClient({
+    // Unset is a supported mode and the refusing client is what makes it safe rather than merely
+    // tolerated: it answers every rate read with the reason, so a non-EMBER stake is refused with a
+    // sentence instead of priced at a default. See `env.ts` on `pricingUrl`.
+    pricing: env.pricingUrl === undefined
+      ? unconfiguredPricingClient()
+      : httpPricingClient({
       baseUrl: env.pricingUrl,
       deadlineMs: env.upstreamDeadlineMs,
       // Deliberately NOT `...common` — no token. See the field's comment: the rate board is public,
