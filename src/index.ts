@@ -294,6 +294,10 @@ const server = createServer({
   ledger,
   // Absent is a supported mode: wallet stakes only, and the custodial routes say so.
   custodialAddress: env.custodialAddress,
+  // Where a BROWSER can reach micro-studio, for an image's `bytesUrl`. Absent is a supported mode
+  // and is the estate's current state — `bytesUrl` is then null, which is honest, rather than a
+  // relative path that would resolve against this service's origin and 404.
+  studioPublicUrl: env.studioPublicUrl,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

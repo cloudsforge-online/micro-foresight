@@ -84,6 +84,13 @@ test('the constraints this service depends on are all present', { skip }, async 
     'ideas_decision_is_a_person',
     'ideas_model_has_provenance',
     'ideas_discard_has_reason',
+    // Half a reference is a claim nothing backs — tessera's `objects_anchor_is_whole`, applied to
+    // an image. `images.test.ts` is what FIRES these; this is the cheap check that catches a
+    // migration edited in a way that quietly dropped one.
+    'markets_image_is_whole',
+    'markets_image_checksum_shape',
+    'ideas_image_is_whole',
+    'ideas_image_checksum_shape',
     'positions_amount_ck',
     'positions_orphan_has_time',
     'resolutions_broadcast_has_hash',

@@ -144,6 +144,9 @@ before(async () => {
     pricing,
     ledger,
     custodialAddress: CUSTODIAL,
+    // No public studio address here: this file proves nothing about images, and `undefined` is
+    // the supported mode that makes every `image.bytesUrl` null.
+    studioPublicUrl: undefined,
   }
   server = createServer(deps)
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))

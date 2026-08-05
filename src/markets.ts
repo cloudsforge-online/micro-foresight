@@ -33,8 +33,16 @@
 import { questionHash, type QuestionDocument } from './questiondoc.ts'
 import { CATEGORY_VERSION, isCategory, isSourceKindFor } from './categories.ts'
 import { requireOperator } from './ideas.ts'
+import { imageView, type ImageReference } from './images.ts'
 import type { Db, Emit, Tx } from './outbox.ts'
-import { MARKET_CLOSED, MARKET_OPENED, MARKET_RESOLVED, MARKET_SETTLED, MARKET_VOIDED } from './outbox.ts'
+import {
+  MARKET_CLOSED,
+  MARKET_IMAGED,
+  MARKET_OPENED,
+  MARKET_RESOLVED,
+  MARKET_SETTLED,
+  MARKET_VOIDED,
+} from './outbox.ts'
 
 export type MarketStatus = 'draft' | 'approved' | 'open' | 'closed' | 'resolved' | 'settled' | 'void'
 export type DeployState = 'pending' | 'building' | 'signed' | 'broadcast' | 'deployed' | 'failed'
@@ -111,6 +119,14 @@ export interface Market {
   readonly voidedAt: Date | null
   readonly voidReason: string | null
   readonly outcome: number | null
+  /**
+   * studio's asset id for this market's header image, and the checksum studio reported for it.
+   *
+   * Both or neither — `markets_image_is_whole`. See `images.ts` for the vocabulary rule: the
+   * checksum is RECORDED, and no field, message or rendered string may call it verified.
+   */
+  readonly imageAssetId: string | null
+  readonly imageChecksum: string | null
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -151,6 +167,8 @@ interface MarketRow {
   readonly voided_at: Date | null
   readonly void_reason: string | null
   readonly outcome: number | null
+  readonly image_asset_id: string | null
+  readonly image_checksum: string | null
   readonly created_at: Date
   readonly updated_at: Date
 }
@@ -160,7 +178,7 @@ const COLUMNS = `id, status, idea_id, idea_status, question, resolution_criteria
   dispute_window_seconds, fee_bps, chain, network, approved_by, approved_at, deploy_state,
   deployer_address, contract_address, deploy_nonce, raw_tx, deploy_tx_hash, custody_audit_id,
   broadcast_at, deploy_attempts, deploy_error, opened_at, closed_at, resolved_at, settled_at,
-  voided_at, void_reason, outcome, created_at, updated_at`
+  voided_at, void_reason, outcome, image_asset_id, image_checksum, created_at, updated_at`
 
 export function toMarket(row: MarketRow): Market {
   return {
@@ -202,6 +220,8 @@ export function toMarket(row: MarketRow): Market {
     voidedAt: row.voided_at,
     voidReason: row.void_reason,
     outcome: row.outcome,
+    imageAssetId: row.image_asset_id,
+    imageChecksum: row.image_checksum,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -589,6 +609,87 @@ export async function voidMarket(
   return market
 }
 
+/* ------------------------------------------------------------------ the header image */
+
+/**
+ * Set or clear a market's header image. `null` clears.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **BOTH COLUMNS MOVE IN ONE UPDATE, ALWAYS.**
+ *
+ * There is deliberately no `setImage`/`clearImage` pair. Two functions would be two places the
+ * pair could come apart, and a clear that forgot `image_checksum` would leave a checksum naming
+ * bytes nothing points at — the half-reference `markets_image_is_whole` exists to refuse. One
+ * function writing both columns from one nullable argument makes the whole/none property
+ * structural rather than remembered, and the constraint is what holds when a future writer
+ * forgets this file exists at all.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * ## When may the image change? In any status, including `settled` and `void`.
+ *
+ * The question that has to be answered first is whether it touches `question_hash`. **It does
+ * not.** `documentFor` above builds the hashed document from ten fields and the image is in none
+ * of them, so this UPDATE leaves `question_hash` byte-for-byte identical and a bettor recomputing
+ * it from the public page still gets the value the deployed contract holds. `questiondoc.ts`
+ * exists so that the CRITERIA cannot be edited under a live market; a picture is not a criterion,
+ * settles nothing, and no clause of any resolution reads it.
+ *
+ * Given that, freezing the image at `settled` would buy nothing and cost something real. A settled
+ * market's page is permanent and public. If an image on it turns out to be unlawful, abusive, or
+ * somebody else's copyright, the only remedy under a freeze would be to delete the market — which
+ * this lifecycle does not permit and should not, because the record of a market that took money is
+ * the one thing that must survive. So the terminal states are precisely where clearing an image
+ * matters MOST, and refusing it there would be a rule that fires only when it does harm.
+ *
+ * What the change is not is undocumented. Every call writes an outbox row in the same transaction
+ * carrying the actor and the time (`MARKET_IMAGED`), which is why there is no `image_set_by`
+ * column: the event log already answers "who changed this picture, and when", and a column would
+ * be a second copy of that answer that can disagree with the first.
+ */
+export async function setMarketImage(
+  tx: Tx,
+  emit: Emit,
+  id: string,
+  image: ImageReference | null,
+  actor: string,
+  now: Date,
+  correlationId: string | null,
+): Promise<Market> {
+  const current = await findMarket(tx, id)
+  if (!current) throw new MarketError('not_found', 'no market with that id', 404)
+
+  const rows = await tx<MarketRow[]>`
+    update markets
+       set image_asset_id = ${image?.assetId ?? null}::uuid,
+           image_checksum = ${image?.checksum ?? null},
+           updated_at     = ${now}
+     where id = ${id}
+    returning ${sql_(tx)}
+  `
+  const row = rows[0]
+  if (!row) throw new MarketError('conflict', 'the market went away while its image was being set')
+  const market = toMarket(row)
+  emit({
+    topic: MARKET_IMAGED,
+    key: id,
+    // The REFERENCE, never a URL. An event is durable and a URL is not: `bytesUrl` is built from
+    // this deployment's `STUDIO_PUBLIC_URL`, and a consumer replaying this event a year from now
+    // would follow an address that may belong to nobody. The asset id and the checksum still name
+    // exactly which bytes were meant, which is what a consumer can actually act on.
+    payload: {
+      id: market.id,
+      status: market.status,
+      imageAssetId: market.imageAssetId,
+      // Recorded, not verified — `images.ts`. Named plainly so no consumer reads it as a proof.
+      imageChecksum: market.imageChecksum,
+      cleared: image === null,
+    },
+    actor,
+    ...(correlationId ? { correlationId } : {}),
+  })
+  return market
+}
+
 function requireTransition(market: Market, to: MarketStatus): void {
   if (!canTransition(market.status, to)) {
     throw new MarketError(
@@ -610,8 +711,19 @@ function sql_(tx: Tx): ReturnType<Tx['unsafe']> {
  * no operator subject: an event goes to `micro-notify` and `micro-activity` and from there towards
  * a user, and every internal field that rides along is a field that ends up in a bundle somebody
  * can read.
+ *
+ * `studioPublicUrl` is optional and defaults to absent, which is what the event emitters above
+ * pass. That is not laziness: a durable event must carry the REFERENCE and not a URL built from
+ * one deployment's configuration — see the note in `setMarketImage`. The HTTP reads pass it, so a
+ * browser gets an `<img src>` it can use.
+ *
+ * **`image` sits in the same object as `questionHash`, `contractAddress` and `outcome`, and it is
+ * the one field here the chain knows nothing about.** `images.ts` carries the argument; the short
+ * version is that a client must not present the picture as though the contract vouched for it. The
+ * field is named `image`, its digest is named `checksum`, and neither this response nor any UI
+ * built on it may use the words verified, attested, on-chain or anchored.
  */
-export function publicView(market: Market): Record<string, unknown> {
+export function publicView(market: Market, studioPublicUrl?: string): Record<string, unknown> {
   return {
     id: market.id,
     status: market.status,
@@ -630,6 +742,9 @@ export function publicView(market: Market): Record<string, unknown> {
     contractAddress: market.contractAddress,
     outcome: market.outcome,
     voidReason: market.voidReason,
+    // Presentational, and the only field in this object the contract knows nothing about. Never
+    // rendered as a property OF the market's on-chain state — see the note above.
+    image: imageView(market.imageAssetId, market.imageChecksum, studioPublicUrl),
     openedAt: market.openedAt?.toISOString() ?? null,
     closedAt: market.closedAt?.toISOString() ?? null,
     resolvedAt: market.resolvedAt?.toISOString() ?? null,

@@ -105,6 +105,32 @@ function optionalOrUndefined(source: Source, name: string): string | undefined {
   return value && value.length > 0 ? value : undefined
 }
 
+/**
+ * An optional absolute origin — scheme and host, nothing else.
+ *
+ * `tessera/src/env.ts:144`'s verbatim, because the value is used the same way: concatenated with a
+ * path to form a URL. A trailing slash or a stray path segment would produce `…/v1//v1/assets/…`
+ * or `…/studio/v1/assets/…`, and both fail as a broken image on a user's page rather than at boot.
+ * Refusing at boot is what turns a configuration typo into a fatal log line with the value in it.
+ */
+function optionalOrigin(source: Source, name: string): string | undefined {
+  const raw = optionalOrUndefined(source, name)
+  if (raw === undefined) return undefined
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new EnvError(`${name} must be an absolute URL (got ${raw})`)
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new EnvError(`${name} must be http or https (got ${url.protocol})`)
+  }
+  if (url.pathname !== '/' || url.search !== '' || url.hash !== '') {
+    throw new EnvError(`${name} must be an origin with no path, query or fragment (got ${raw})`)
+  }
+  return url.origin
+}
+
 function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
   const raw = source[name]?.trim()
   if (!raw) return fallback
@@ -320,6 +346,35 @@ export interface Env {
    * supported mode: no caps readable, no seeds planned (21 §8).
    */
   readonly adminApiUrl: string | undefined
+  /**
+   * The **browser-reachable** origin of micro-studio, used for one thing: composing the `bytesUrl`
+   * a client puts in `<img src>` for a market's or an idea's header image.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **NOT `STUDIO_URL`, AND THE DIFFERENCE IS THE WHOLE POINT OF THE SEPARATE NAME.**
+   *
+   * `tessera/src/env.ts:227` has `STUDIO_URL` and it is a SERVER-TO-SERVER address: tessera's own
+   * process dials it with a service token, and in the estate it resolves to a container name on a
+   * private compose network. A browser cannot reach that, ever. Reusing the name here would produce
+   * an `<img src>` pointing at an address that exists only inside the cluster — which fails as a
+   * broken image on the user's page and as a green health check everywhere else.
+   *
+   * So the name says which side of the trust boundary it is for. foresight makes no server-to-
+   * server call to studio at all (`images.ts`: this service holds a reference and authorises it,
+   * and does not fetch bytes or recompute a checksum), so there is nothing here for a `STUDIO_URL`
+   * to do.
+   *
+   * **Absent is a supported mode**, and it is the mode the estate is in today: the compose publishes
+   * studio on `127.0.0.1:4111` with no public hostname, and `studio` has no row in the
+   * `@cloudsforge/ui` surfaces registry. Unset, every `image.bytesUrl` is `null` — which says "this
+   * deployment cannot tell you where the bytes are" — rather than a relative path that would
+   * resolve against foresight's own origin and 404. The estate has written that lesson down once
+   * already: `deploy/compose/docker-compose.estate.yml` leaves `STUDIO_ASSET_BASE_URL` unset
+   * because a base URL there "would mint storageUrls that look fetchable and 404 — a zero wearing a
+   * status code".
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly studioPublicUrl: string | undefined
   /** The custody-held address that may resolve or void a market. See `src/resolve.ts`. */
   readonly oracleAddress: string
   /** Custody's binding for the oracle key: the userId it was minted under. */
@@ -442,6 +497,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     houseAddress: optionalAddress(source, 'FORESIGHT_HOUSE_ADDRESS'),
     custodialAddress: optionalAddress(source, 'FORESIGHT_CUSTODIAL_ADDRESS'),
     adminApiUrl: optionalOrUndefined(source, 'ADMIN_API_URL'),
+    studioPublicUrl: optionalOrigin(source, 'STUDIO_PUBLIC_URL'),
     oracleAddress: address(source, 'FORESIGHT_ORACLE_ADDRESS'),
     oracleUserId: required(source, 'FORESIGHT_ORACLE_USER_ID'),
     oracleOrderId: required(source, 'FORESIGHT_ORACLE_ORDER_ID'),

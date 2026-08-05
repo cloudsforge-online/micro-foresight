@@ -46,7 +46,18 @@ import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { CATEGORIES, CATEGORY_VERSION, REFUSALS } from './categories.ts'
 import type { ChainId } from './chains.ts'
 import { callData } from './evm.ts'
-import { IdeaError, approveIdea, discardIdea, editIdea, findIdea, insertIdea, listIdeas } from './ideas.ts'
+import {
+  IdeaError,
+  approveIdea,
+  discardIdea,
+  editIdea,
+  findIdea,
+  ideaView,
+  insertIdea,
+  listIdeas,
+  setIdeaImage,
+} from './ideas.ts'
+import { ImageError, parseImageReference } from './images.ts'
 import {
   IdempotencyInFlightError,
   IdempotencyKeyReuseError,
@@ -63,6 +74,7 @@ import {
   listMarkets,
   openMarket,
   publicView,
+  setMarketImage,
   voidMarket,
   type MarketStatus,
 } from './markets.ts'
@@ -152,6 +164,12 @@ export interface ServerDeps {
    * route refuses plainly rather than half-working.
    */
   readonly custodialAddress: string | undefined
+  /**
+   * The browser-reachable origin of micro-studio, for composing an image's `bytesUrl`. Undefined
+   * is a supported mode and `image.bytesUrl` is then null — `env.ts` carries the argument for why
+   * this is a separate variable from tessera's server-to-server `STUDIO_URL`.
+   */
+  readonly studioPublicUrl: string | undefined
   readonly beforeScrape?: () => Promise<void>
   readonly now?: () => Date
 }
@@ -498,6 +516,9 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
         ctx.requestId,
       )
     }
+    if (err instanceof ImageError) {
+      return errorReply(err.status, err.code, err.message, ctx.requestId)
+    }
     if (err instanceof IdeaError) {
       const status = err.code === 'not_found' ? 404 : err.code === 'not_proposed' ? 409 : 400
       return errorReply(status, err.code, err.message, ctx.requestId)
@@ -566,6 +587,49 @@ function buildRoutes(): Route[] {
       },
     })),
 
+    /**
+     * Where a client uploads a header image, and what it may send. **Public and unauthenticated.**
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THIS EXISTS SO NO CLIENT EVER GUESSES micro-studio's ADDRESS.**
+     *
+     * `foresight-web/src/lib/foresight.ts` opens with the two defects this estate has actually
+     * shipped, both of one kind — a client written against a surface somebody imagined rather than
+     * the one the service registers. `micro-wallet` called `POST /v1/quotes` at a service that
+     * serves `/rates`; `micro-market` called a `/v1` path at a service with no `/v1` routes at all,
+     * and every listing 403'd. A browser that derived `https://studio.<apex>` from its own hostname
+     * would be the third: `studio` has no row in the `@cloudsforge/ui` surfaces registry, so there
+     * is no registry answer to derive FROM, and the guess would be a hostname nobody has published.
+     *
+     * The deployment knows its own studio address because it was configured with it. So it says so,
+     * once, here, and the client reads it. `studioUrl` is null when `STUDIO_PUBLIC_URL` is unset —
+     * which is a real answer ("this deployment cannot serve images from here") that a client can
+     * render as a sentence, rather than a broken upload control.
+     *
+     * Unauthenticated because everything in it is public by construction: a hostname meant to be
+     * typed into a browser, a path published in studio's own API, and a list of media types.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('GET', '/image-config', async (_ctx, deps) => ({
+      status: 200,
+      body: {
+        studioUrl: deps.studioPublicUrl ?? null,
+        // studio's own spelling (`studio/src/server.ts`), not a path composed here.
+        uploadPath: '/v1/uploads',
+        // ── `public`, and it is not a default worth changing ─────────────────────────────────
+        // studio's `GET /v1/assets/:id/bytes` requires NO Authorization header when the asset is
+        // public, and requires one when it is private. A browser sends no bearer token on an
+        // `<img src>`, so a private asset is a broken picture on every page in the estate. A
+        // market's header image is shown on a public page to anonymous readers by definition.
+        visibility: 'public',
+        // ── A CONVENIENCE FOR THE FILE PICKER, NOT A SECURITY CONTROL ────────────────────────
+        // This list belongs in the `accept` attribute so a user is not offered files that will be
+        // refused. It decides nothing: studio reads the MAGIC BYTES and is the only thing that
+        // decides what an upload is. A caller can send any bytes under any name, and does.
+        accept: ['image/png', 'image/jpeg', 'image/webp'],
+      },
+    })),
+
     /* ---------------------------------------------------------------- public reads */
 
     define('GET', '/markets', async (ctx, deps) => {
@@ -573,7 +637,12 @@ function buildRoutes(): Route[] {
       const status = requested === null ? null : parseStatus(requested)
       const limit = parseLimit(ctx.url.searchParams.get('limit'))
       const markets = await listMarkets(deps.sql, status, limit)
-      return { status: 200, body: { markets: markets.map(publicView) } }
+      // The image reference is composed per response rather than stored composed, so a deployment
+      // that gains a public studio address starts serving usable `bytesUrl`s without a backfill.
+      return {
+        status: 200,
+        body: { markets: markets.map((market) => publicView(market, deps.studioPublicUrl)) },
+      }
     }),
 
     /**
@@ -597,7 +666,7 @@ function buildRoutes(): Route[] {
       return {
         status: 200,
         body: {
-          market: publicView(market),
+          market: publicView(market, deps.studioPublicUrl),
           pool,
           houseSeed: houseSeed ? houseSeedView(houseSeed) : null,
           document: {
@@ -981,7 +1050,7 @@ function buildRoutes(): Route[] {
         throw new BadRequestError('status must be proposed, approved or discarded')
       }
       const ideas = await listIdeas(deps.sql, status, parseLimit(ctx.url.searchParams.get('limit')))
-      return { status: 200, body: { ideas } }
+      return { status: 200, body: { ideas: ideas.map((idea) => ideaView(idea, deps.studioPublicUrl)) } }
     }),
 
     /** An operator writes a question themselves. The same validation the pipeline's output gets. */
@@ -1003,7 +1072,7 @@ function buildRoutes(): Route[] {
         },
         now,
       )
-      return { status: 201, body: { idea } }
+      return { status: 201, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
     }),
 
     define('PATCH', '/ideas/:id', async (ctx, deps) => {
@@ -1025,7 +1094,7 @@ function buildRoutes(): Route[] {
         },
         now,
       )
-      return { status: 200, body: { idea } }
+      return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
     }),
 
     define('POST', '/ideas/:id/approve', async (ctx, deps) => {
@@ -1035,7 +1104,7 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
       const now = (deps.now ?? (() => new Date()))()
       const idea = await approveIdea(deps.sql, id, operatorOf(principal), optionalString(body, 'note') ?? null, now)
-      return { status: 200, body: { idea } }
+      return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
     }),
 
     define('POST', '/ideas/:id/discard', async (ctx, deps) => {
@@ -1052,7 +1121,7 @@ function buildRoutes(): Route[] {
         optionalString(body, 'note') ?? null,
         now,
       )
-      return { status: 200, body: { idea } }
+      return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
     }),
 
     /* ---------------------------------------------------------------- the market lifecycle */
@@ -1084,7 +1153,7 @@ function buildRoutes(): Route[] {
         },
         now,
       )
-      return { status: 201, body: { market: publicView(market) } }
+      return { status: 201, body: { market: publicView(market, deps.studioPublicUrl) } }
     }),
 
     /**
@@ -1171,7 +1240,7 @@ function buildRoutes(): Route[] {
       return {
         status: 200,
         body: {
-          market: publicView(result.market),
+          market: publicView(result.market, deps.studioPublicUrl),
           houseSeed: result.seed ? houseSeedView(result.seed) : null,
         },
       }
@@ -1240,7 +1309,7 @@ function buildRoutes(): Route[] {
       return {
         status: 200,
         body: {
-          market: publicView(result.market),
+          market: publicView(result.market, deps.studioPublicUrl),
           houseSeed: result.seed ? houseSeedView(result.seed) : null,
         },
       }
@@ -1319,7 +1388,105 @@ function buildRoutes(): Route[] {
       const voided = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
         voidMarket(tx, emit, id, requireString(body, 'reason'), operatorOf(principal), now, ctx.requestId),
       )
-      return { status: 200, body: { market: publicView(voided) } }
+      return { status: 200, body: { market: publicView(voided, deps.studioPublicUrl) } }
+    }),
+
+    /* ---------------------------------------------------------------- the header image */
+
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **NOTHING BELOW MAY DESCRIBE AN IMAGE AS VERIFIED, ATTESTED, ON-CHAIN OR ANCHORED.**
+     *
+     * These four routes sit in the same file as `stake-intent`, `deploy` and `resolve`, which
+     * genuinely do reach a chain, and they answer with a `checksum` that looks exactly like the
+     * `questionHash` two fields away. It is not the same kind of thing. `questionHash` is written
+     * into a deployed contract and a bettor can recompute it; an image checksum is a value studio
+     * measured and a client relayed here, which this service never re-measures. `images.ts` sets
+     * out the full argument, including why the false version of this claim would be undetectable:
+     * Hearth has no Registry of Authorship to check against (`tessera/src/kiln.ts:373-392` records
+     * that the Solidity was never written) and studio's `anchor.state` is `'unanchored'` on every
+     * asset it has produced.
+     *
+     * The strongest honest phrase is "hash recorded". The safest is to say nothing at all.
+     *
+     * ── AUTHORITY IS `requireAdmin`, AND THAT IS NOT A SHORTCUT ────────────────────────────────
+     *
+     * A market in this service has no user owner and cannot have one: `POST /markets` is
+     * `requireAdmin`, `POST /markets/:id/approve` records an `operator:<id>` subject, and
+     * `markets_unapproved_never_opens` refuses to let anything that is not one reach `open`. Ideas
+     * are the same — the whole queue is behind `requireAdmin`. So "the owner may set the image"
+     * resolves, here, to "an operator may", and every one of these routes uses the SAME
+     * `requireAdmin` + `operatorOf` pair every other mutating route uses. Inventing a per-market
+     * owner column so that this feature could have its own notion of ownership would be a second
+     * authority model in a service that has one, and a second model is one that will disagree with
+     * the first.
+     *
+     * A user with a token but no admin role therefore gets 403 from `requireAdmin`, which is the
+     * "a non-owner cannot change somebody else's image" property in the shape this service can
+     * actually state it.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+
+    /**
+     * Set a market's header image to an asset already uploaded to micro-studio.
+     *
+     * The bytes never pass through here. A client uploads to studio's
+     * `POST /v1/uploads?visibility=public` — which is where every check lives: magic bytes, the SVG
+     * refusal, the dimension bounds, the EXIF strip — and sends this route the id and checksum
+     * studio answered with. `visibility=public` is not a detail: studio's bytes route needs no
+     * Authorization header for a public asset, and a browser sends none on an `<img src>`.
+     */
+    define('PUT', '/markets/:id/image', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireAdmin(principal)
+      const id = uuidParam(ctx, 'id')
+      const image = parseImageReference(await readJson(ctx.req))
+      const now = (deps.now ?? (() => new Date()))()
+      const market = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+        setMarketImage(tx, emit, id, image, operatorOf(principal), now, ctx.requestId),
+      )
+      return { status: 200, body: { market: publicView(market, deps.studioPublicUrl) } }
+    }),
+
+    /**
+     * Remove a market's header image. Both columns go to null together — `markets_image_is_whole`.
+     *
+     * Deliberately available in EVERY status, `settled` and `void` included. See `setMarketImage`
+     * for the reasoning; the short version is that a settled market's page is permanent, and a rule
+     * forbidding removal there would fire only in the case where removal is most necessary.
+     */
+    define('DELETE', '/markets/:id/image', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireAdmin(principal)
+      const id = uuidParam(ctx, 'id')
+      const now = (deps.now ?? (() => new Date()))()
+      const market = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+        setMarketImage(tx, emit, id, null, operatorOf(principal), now, ctx.requestId),
+      )
+      return { status: 200, body: { market: publicView(market, deps.studioPublicUrl) } }
+    }),
+
+    define('PUT', '/ideas/:id/image', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireAdmin(principal)
+      const id = uuidParam(ctx, 'id')
+      const image = parseImageReference(await readJson(ctx.req))
+      const now = (deps.now ?? (() => new Date()))()
+      const idea = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+        setIdeaImage(tx, emit, id, image, operatorOf(principal), now, ctx.requestId),
+      )
+      return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
+    }),
+
+    define('DELETE', '/ideas/:id/image', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireAdmin(principal)
+      const id = uuidParam(ctx, 'id')
+      const now = (deps.now ?? (() => new Date()))()
+      const idea = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+        setIdeaImage(tx, emit, id, null, operatorOf(principal), now, ctx.requestId),
+      )
+      return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
     }),
   ]
 }

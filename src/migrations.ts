@@ -1080,6 +1080,117 @@ export const MIGRATIONS: readonly Migration[] = [
          and blocked_reason like 'micro-pricing publishes no LTC rate%';
     `,
   },
+
+  {
+    version: 11,
+    name: 'content_images',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- A HEADER IMAGE FOR A MARKET AND FOR AN IDEA — AS A REFERENCE INTO micro-studio, AND
+      -- NOTHING ELSE.
+      --
+      -- No bytes column, no upload directory, no bucket. studio is the estate's single media
+      -- service: it validates magic bytes, refuses SVG, bounds dimensions, strips EXIF and GPS and
+      -- serves with 'nosniff' and a restrictive CSP (studio/src/assets.ts). A second copy of that
+      -- machinery here would be a second thing to secure, back up and cache — and the copy that
+      -- gets the next hardening fix six months late. So this service holds an id and a content
+      -- address, and authorises who may change them.
+      --
+      -- ── ONE IMAGE, NOT A GALLERY ─────────────────────────────────────────────────────────────
+      --
+      -- A market is a QUESTION, not a product listing. A gallery would invite a sequence of images
+      -- that together say something the question does not — and the question is the contract with
+      -- strangers (src/questiondoc.ts). One header image is decoration for a question; five are an
+      -- argument for an outcome.
+      --
+      -- ── THE IMAGE IS NOT IN 'question_hash', AND A READER WILL RIGHTLY WONDER ─────────────────
+      --
+      -- 'questiondoc.ts' hashes ten fields — the document version, the question, the criteria, the
+      -- category and its version, the source kind and ref, the close time, the dispute window and
+      -- the fee — and hands the digest to the market's constructor. The image is in NONE of them,
+      -- so setting or clearing it leaves 'question_hash' byte-for-byte unchanged and the market
+      -- page still recomputes to the value the contract holds.
+      --
+      -- That is deliberate rather than an oversight. The hash exists so a bettor can check that
+      -- the CRITERIA they are betting under have not been edited since the contract was deployed
+      -- (questiondoc.ts's header: "resolution honesty is structural"). A picture settles nothing:
+      -- no clause of any resolution reads it, and no payout depends on it. Folding it into the
+      -- hash would make an image change look like a criteria change to every checker, which would
+      -- teach readers that a hash mismatch is routine — and a mismatch that is routine is a check
+      -- that no longer detects anything.
+      --
+      -- ── 'sha256:<64 lowercase hex>', THE ESTATE'S ONE SPELLING FOR A CONTENT ADDRESS ──────────
+      --
+      -- Exactly studio's own (studio/src/assets.ts) and exactly tessera's
+      -- ('objects_checksum_shape', tessera/src/migrations.ts:628 region), so a checksum copied out
+      -- of a studio response is the value this column holds with no reformatting step in between
+      -- that could drop the prefix on one path and not the other. tessera/src/itemasset.ts:45
+      -- records the same refusal to normalise, for the same reason: a function that accepted a
+      -- bare hex would be the one place two spellings of one image could be born.
+      --
+      -- **The checksum is RECORDED, never verified here.** foresight does not fetch the bytes and
+      -- does not recompute the digest; it stores what the uploader was told by studio. The shape
+      -- check below is a shape check. Nothing in this service's API or UI may therefore call the
+      -- image verified, attested or anchored — see the note on the image routes in src/server.ts.
+      --
+      -- ── HALF A REFERENCE IS A CLAIM NOTHING BACKS ────────────────────────────────────────────
+      --
+      -- Modelled directly on tessera's 'objects_anchor_is_whole' (tessera/src/migrations.ts:628),
+      -- whose comment reads "half an anchor — a block with no transaction, a timestamp with no
+      -- block — is a claim the chain does not back". The parallel is exact. An id with no checksum
+      -- is a row that says "there is an image, and here is where it lives" while holding nothing
+      -- that could ever identify WHICH bytes were meant; a checksum with no id names bytes nobody
+      -- can fetch. Both render as a broken picture in one client and as nothing at all in the
+      -- next, and neither is recoverable after the fact, because the missing half was never
+      -- written down anywhere.
+      --
+      -- The application sets and clears both columns in one UPDATE (src/markets.ts, src/ideas.ts).
+      -- This is the second enforcement — the beacon discipline this file's header sets out: the
+      -- handler is what gives a caller a readable error, and the constraint is what holds against
+      -- the next write path, the hand-run migration, and the operator with psql at 3am.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table markets
+        add column if not exists image_asset_id  uuid,
+        add column if not exists image_checksum  text;
+
+      alter table markets
+        add constraint markets_image_checksum_shape
+        check (image_checksum is null or image_checksum ~ '^sha256:[0-9a-f]{64}$');
+
+      alter table markets
+        add constraint markets_image_is_whole
+        check (
+          (image_asset_id is null and image_checksum is null)
+          or (image_asset_id is not null and image_checksum is not null)
+        );
+
+      alter table ideas
+        add column if not exists image_asset_id  uuid,
+        add column if not exists image_checksum  text;
+
+      alter table ideas
+        add constraint ideas_image_checksum_shape
+        check (image_checksum is null or image_checksum ~ '^sha256:[0-9a-f]{64}$');
+
+      alter table ideas
+        add constraint ideas_image_is_whole
+        check (
+          (image_asset_id is null and image_checksum is null)
+          or (image_asset_id is not null and image_checksum is not null)
+        );
+
+      -- No foreign key, and its absence is the design rather than a shortcut. The asset lives in
+      -- micro-studio's database, in another process; there is nothing for postgres to reference.
+      -- The same is true of tessera's 'studio_asset_id' (tessera/src/migrations.ts:605), which is
+      -- likewise a bare text column. What replaces referential integrity across that boundary is
+      -- the content address: if the asset is gone, the checksum still says exactly which bytes
+      -- were meant, which is more than a dangling id would have told anybody.
+      --
+      -- No index either. Nothing queries markets or ideas BY image, and an index nothing reads is
+      -- a write cost and a page cache eviction paid for ever in exchange for nothing.
+    `,
+  },
 ]
 
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

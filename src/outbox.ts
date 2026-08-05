@@ -59,7 +59,7 @@ export type Emit = (event: DomainEvent) => void
  * **None is in `@cloudsforge/contracts-events` `TOPICS` yet.** That registry is the only place a
  * topic name may be spelled, it is exact-pinned, and adding to it is a coordinated release — so
  * they are declared here for now and the registry entries land with the release that gives
- * `micro-notify` and `micro-activity` their subscriptions. All five already satisfy the registry's
+ * `micro-notify` and `micro-activity` their subscriptions. All seven already satisfy the registry's
  * shape rule (`<service>.<aggregate>.<past-tense-verb>`, three lowercase segments), which
  * `outbox.test.ts` asserts, so registering them later is an addition and never a rename.
  */
@@ -69,12 +69,35 @@ export const MARKET_RESOLVED = 'foresight.market.resolved'
 export const MARKET_VOIDED = 'foresight.market.voided'
 export const MARKET_SETTLED = 'foresight.market.settled'
 
+/**
+ * A header image was set OR cleared. **One topic for both, not two.**
+ *
+ * A clear is not the absence of a change; it is a change a consumer needs at least as urgently as
+ * a set, because a cached card still rendering a picture that has been taken down is exactly the
+ * failure that matters. Two topics would double the subscriptions anyone has to register in order
+ * to learn one fact, and the fact is "this content's image is now X", where X may be nothing. The
+ * payload carries `cleared` so a consumer never has to infer it from a null.
+ *
+ * These are also this service's audit trail for the image: `setMarketImage` deliberately adds no
+ * `image_set_by` column, because the outbox row already carries the actor, the time and the
+ * correlation id, and a column would be a second copy of that answer able to disagree with the
+ * first.
+ *
+ * The shape rule below is the registry's — three lowercase alphabetic segments — which is why the
+ * verb is `imaged` rather than `image_set`: an underscore would not match, and a name that cannot
+ * be registered later is a rename waiting to break a subscriber.
+ */
+export const MARKET_IMAGED = 'foresight.market.imaged'
+export const IDEA_IMAGED = 'foresight.idea.imaged'
+
 export const TOPICS: readonly string[] = Object.freeze([
   MARKET_OPENED,
   MARKET_CLOSED,
   MARKET_RESOLVED,
   MARKET_VOIDED,
   MARKET_SETTLED,
+  MARKET_IMAGED,
+  IDEA_IMAGED,
 ])
 
 /**

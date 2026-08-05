@@ -25,7 +25,8 @@
 
 import { createHash } from 'node:crypto'
 import { isCategory, isRefusal, isSourceKindFor } from './categories.ts'
-import type { Db, Tx } from './outbox.ts'
+import { imageView, type ImageReference } from './images.ts'
+import { IDEA_IMAGED, type Db, type Emit, type Tx } from './outbox.ts'
 
 export type IdeaStatus = 'proposed' | 'approved' | 'discarded'
 export type IdeaOrigin = 'model' | 'operator'
@@ -58,6 +59,17 @@ export interface Idea {
   readonly decidedAt: Date | null
   readonly decisionNote: string | null
   readonly refusalId: string | null
+  /**
+   * The proposal's header image, as a micro-studio reference. Both or neither —
+   * `ideas_image_is_whole`.
+   *
+   * An image on an IDEA is not carried forward into the market built from it, and that omission is
+   * deliberate. `createDraft` copies the fields the question is made of; a picture chosen while a
+   * proposal was being judged is not one of them, and copying it would silently publish an
+   * operator's working sketch on a page that takes money. A market's image is set on the market.
+   */
+  readonly imageAssetId: string | null
+  readonly imageChecksum: string | null
 }
 
 export class IdeaError extends Error {
@@ -173,11 +185,14 @@ interface IdeaRow {
   readonly decided_at: Date | null
   readonly decision_note: string | null
   readonly refusal_id: string | null
+  readonly image_asset_id: string | null
+  readonly image_checksum: string | null
 }
 
 const COLUMNS = `id, status, question, resolution_criteria, category, category_version,
   resolution_source_kind, resolution_source_ref, suggested_close_time, origin, search_query,
-  sources, model_id, prompt_sha256, proposed_at, decided_by, decided_at, decision_note, refusal_id`
+  sources, model_id, prompt_sha256, proposed_at, decided_by, decided_at, decision_note, refusal_id,
+  image_asset_id, image_checksum`
 
 function toIdea(row: IdeaRow): Idea {
   return {
@@ -200,6 +215,27 @@ function toIdea(row: IdeaRow): Idea {
     decidedAt: row.decided_at,
     decisionNote: row.decision_note,
     refusalId: row.refusal_id,
+    imageAssetId: row.image_asset_id,
+    imageChecksum: row.image_checksum,
+  }
+}
+
+/**
+ * What an idea looks like in a response.
+ *
+ * A view rather than the row, and it exists for one reason: `bytesUrl` is built from this
+ * deployment's `STUDIO_PUBLIC_URL`, which the `Idea` value has no business knowing. The two raw
+ * columns are dropped in favour of the composed `image`, so a client has one shape to read rather
+ * than three fields it has to reassemble — and cannot reassemble them wrongly into half a
+ * reference.
+ */
+export function ideaView(idea: Idea, studioPublicUrl?: string): Record<string, unknown> {
+  const { imageAssetId, imageChecksum, ...rest } = idea
+  return {
+    ...rest,
+    // Recorded, not verified — `images.ts`. The operator queue must not present a proposal's
+    // picture as anything the platform has checked beyond its shape.
+    image: imageView(imageAssetId, imageChecksum, studioPublicUrl),
   }
 }
 
@@ -347,6 +383,59 @@ export async function editIdea(
   const row = rows[0]
   if (!row) throw new IdeaError('not_proposed', 'the proposal was decided while it was being edited')
   return toIdea(row)
+}
+
+/**
+ * Set or clear a proposal's header image. `null` clears.
+ *
+ * `setMarketImage`'s shape, verbatim, and for its reasons — one function writing both columns from
+ * one nullable argument, so half a reference is not something this file can produce and
+ * `ideas_image_is_whole` is the second enforcement rather than the only one.
+ *
+ * **Allowed in every status, unlike `editIdea` one function up.** That difference is deliberate
+ * and it is worth stating, because the two look like the same kind of act and are not. Editing a
+ * decided proposal is refused because a market may have been built from it and an edit would
+ * change the text a `questionHash` was computed over — `questiondoc.ts`'s whole argument. An image
+ * is in no document and in no hash, is copied into no market (see `Idea.imageAssetId`), and so
+ * changing one on a discarded proposal changes nothing anybody has relied on. The narrower rule
+ * would only mean an operator could not remove a picture from a proposal they had just refused,
+ * which is precisely the proposal most likely to need one removed.
+ */
+export async function setIdeaImage(
+  tx: Tx,
+  emit: Emit,
+  id: string,
+  image: ImageReference | null,
+  actor: string,
+  now: Date,
+  correlationId: string | null,
+): Promise<Idea> {
+  const rows = await tx<IdeaRow[]>`
+    update ideas
+       set image_asset_id = ${image?.assetId ?? null}::uuid,
+           image_checksum = ${image?.checksum ?? null},
+           updated_at     = ${now}
+     where id = ${id}
+    returning ${tx.unsafe(COLUMNS)}
+  `
+  const row = rows[0]
+  if (!row) throw new IdeaError('not_found', 'no proposal with that id')
+  const idea = toIdea(row)
+  emit({
+    topic: IDEA_IMAGED,
+    key: id,
+    // The reference, never a URL — see `setMarketImage` for why a durable event must not carry one.
+    payload: {
+      id: idea.id,
+      status: idea.status,
+      imageAssetId: idea.imageAssetId,
+      imageChecksum: idea.imageChecksum,
+      cleared: image === null,
+    },
+    actor,
+    ...(correlationId ? { correlationId } : {}),
+  })
+  return idea
 }
 
 const OPERATOR = /^operator:[A-Za-z0-9._:-]{1,128}$/

@@ -38,7 +38,11 @@ beforeEach(async () => {
  * is an ADDITION and never a rename, which is what stops a subscriber breaking.
  */
 test('every topic satisfies the registry’s shape rule', () => {
-  assert.equal(TOPICS.length, 5)
+  // Seven since the header image landed: `foresight.market.imaged` and `foresight.idea.imaged`.
+  // The verb is `imaged` rather than `image_set` because the regex below admits no underscore, and
+  // a name that could not be registered later would have to be renamed — which is the one change
+  // that breaks a subscriber.
+  assert.equal(TOPICS.length, 7)
   for (const topic of TOPICS) {
     assert.match(topic, /^[a-z]+\.[a-z]+\.[a-z]+$/, `${topic} is not <service>.<aggregate>.<verb>`)
     assert.ok(topic.startsWith('foresight.'), `${topic} does not name this service`)

@@ -232,3 +232,31 @@ test('PRICING_URL is optional, and its absence refuses a rate rather than defaul
     (err: unknown) => err instanceof Error && /no PRICING_URL/.test(err.message),
   )
 })
+
+test('STUDIO_PUBLIC_URL is optional, and a present value must be an ORIGIN', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // Absent is the estate's current state — studio is published on 127.0.0.1:4111 with no public
+  // hostname — so requiring it would refuse to boot a working deployment. Absent means every
+  // `image.bytesUrl` is null, which is honest: a relative path would resolve against foresight's
+  // own origin in a browser and 404.
+  //
+  // The origin check earns its place because the failure it prevents is invisible from the server.
+  // `https://studio.example/` with its trailing slash composes `…//v1/assets/…`, and a path
+  // segment composes `…/studio/v1/assets/…`; both are 404s on somebody's page and a green
+  // /readyz here. Refusing at boot turns a silent broken image into a fatal line with the value.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  assert.equal(loadEnv(MINIMAL).studioPublicUrl, undefined)
+  assert.equal(
+    loadEnv({ ...MINIMAL, STUDIO_PUBLIC_URL: 'https://studio.example.invalid' }).studioPublicUrl,
+    'https://studio.example.invalid',
+  )
+  // A trailing slash is an origin with pathname '/', which URL normalises away — accepted, and it
+  // composes correctly because `origin` never carries one.
+  assert.equal(
+    loadEnv({ ...MINIMAL, STUDIO_PUBLIC_URL: 'https://studio.example.invalid/' }).studioPublicUrl,
+    'https://studio.example.invalid',
+  )
+  for (const bad of ['studio.example.invalid', 'https://studio.example.invalid/v1', 'ftp://s.invalid']) {
+    assert.throws(() => loadEnv({ ...MINIMAL, STUDIO_PUBLIC_URL: bad }), EnvError, `${bad} was accepted`)
+  }
+})
