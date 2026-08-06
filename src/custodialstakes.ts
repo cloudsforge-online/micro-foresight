@@ -4,7 +4,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **A CUSTODIAL STAKE IS A LEDGER ENTRY, NOT A SIGNING CAPABILITY.**
  *
- * `custody/src/gates.ts:65` lists the purposes custody will sign for — `deployer`, `treasury`,
+ * `custody/src/gates.ts` lists the purposes custody will sign for — `deployer`, `treasury`,
  * `deposit` — and `user` is deliberately not among them. Nothing here asks for that to change. The
  * platform stakes the converted EMBER on chain from its OWN published address, exactly as the
  * house seed already does (`houseseed.ts`, and the argument at its head), and the user's share of
@@ -435,8 +435,8 @@ export async function markSettled(
  * The accounts this service names, matching `micro-wallet`'s exactly.
  *
  * `(subject, asset_code, purpose)` is the ledger's unique account key
- * (`ledger/src/migrations.ts:136-143`); `available` and `escrow` are two of the seven purposes its
- * CHECK admits (`:131`), and `clearing` is `wallet/src/money.ts:102-104` verbatim — subject
+ * (`ledger/src/migrations.ts`); `available` and `escrow` are two of the seven purposes its
+ * CHECK admits, and `clearing` is `wallet/src/money.ts` verbatim — subject
  * `clearing`, purpose `available`, type `clearing`. Inventing a shape here would not create a
  * second account, it would fail the CHECK, which is the right way for this mistake to end.
  */
@@ -449,8 +449,8 @@ function userAccount(subject: string, assetCode: string, purpose: 'available' | 
  *
  * The two assets have no arithmetic relationship, so an entry moving one into the other cannot
  * balance as a single pair — the ledger's balancing trigger is **per `asset_code`**
- * (`ledger/src/migrations.ts:302-313`). Clearing is what makes two balanced pairs out of one
- * conversion, and its type is exempt from the overdraft trigger (`ledger/src/migrations.ts:467`)
+ * (`ledger/src/migrations.ts`). Clearing is what makes two balanced pairs out of one
+ * conversion, and its type is exempt from the overdraft trigger (`ledger/src/migrations.ts`)
  * precisely so it may sit either side of zero while a conversion is in flight.
  *
  * It is also where this design's honesty lives. Across one market, `clearing:EMBER` nets to
@@ -476,9 +476,9 @@ function clearing(assetCode: string) {
  * it struck. Nothing later in the market's life re-opens that.
  *
  * **Kind `market_escrow`.** In the ledger's closed vocabulary
- * (`ledger/src/migrations.ts:182-188`), and NOT one of the three acquisition kinds migration 13's
+ * (`ledger/src/migrations.ts`), and NOT one of the three acquisition kinds migration 13's
  * trigger refuses for a retired asset — those are `purchase`, `subscription_charge` and
- * `deposit_credited` (`ledger/src/migrations.ts:978`). So a stake does not trip that guard. It
+ * `deposit_credited` (`ledger/src/migrations.ts`). So a stake does not trip that guard. It
  * could not carry a retired asset anyway: `IssuableAssetCode` refuses `SHARD` at compile time and
  * `stake_assets_not_retired` refuses the registry row.
  *
@@ -577,7 +577,7 @@ export function refundPostings(stake: CustodialStake): readonly Posting[] {
  * BTC leg here at all, because the BTC stopped being the user's at `escrowPostings`.
  *
  * **`payoutWei` is what the CONTRACT paid**, read from the chain, never computed here. The pool is
- * the contract's storage and `payoutOf` is its arithmetic (`ForesightMarket.sol:405-416`); a
+ * the contract's storage and `payoutOf` is its arithmetic (`ForesightMarket.sol`); a
  * number this service worked out for itself would be a second opinion about somebody else's money,
  * and 19 §2.3.1 is explicit that bookkeeping mirrors the chain and never the reverse.
  *

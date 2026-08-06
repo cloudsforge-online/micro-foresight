@@ -19,11 +19,11 @@
  * ## How the oracle posts, and why it looks strange
  *
  * The oracle key is held by `micro-custody`, whose EVM policy for a `deployer`-purpose address
- * permits exactly one shape: a zero-value contract CREATION (`custody/src/signing.ts:210-231`).
+ * permits exactly one shape: a zero-value contract CREATION (`custody/src/signing.ts`).
  * There is no purpose in custody today that signs a contract call — `transfer` requires empty
  * calldata and says in terms that widening it would turn the key into a signing oracle
- * (`custody/src/signing.ts:239-245`), `SIGNABLE_PURPOSES` is three names (`custody/src/gates.ts:35`),
- * and `custody_keys_purpose_ck` will not store a fourth (`custody/src/migrations.ts:117`).
+ * (`custody/src/signing.ts`), `SIGNABLE_PURPOSES` is three names (`custody/src/gates.ts`),
+ * and `custody_keys_purpose_ck` will not store a fourth (`custody/src/migrations.ts`).
  *
  * So the resolution IS a contract creation: a `ForesightResolver` whose constructor calls
  * `oracleAct` and which then deploys with no runtime code at all. The market checks
@@ -85,7 +85,7 @@ export interface Resolution {
  * row verbatim, and:
  *
  *   1. **It 500'd from the moment the oracle signed.** `oracleNonce` is a `bigint`, `send()`
- *      serialises with `JSON.stringify` (`server.ts:944`), and JSON.stringify THROWS on a bigint
+ *      serialises with `JSON.stringify` (`server.ts`), and JSON.stringify THROWS on a bigint
  *      rather than coercing it. So the route worked for exactly as long as the resolution had not
  *      been signed — which is to say, it failed on every call an operator would actually make,
  *      while its tests (which never covered the route) stayed green.
@@ -336,7 +336,7 @@ export async function listOutstandingResolutions(sql: Db, limit: number): Promis
  * 23505 on `resolutions_in_flight_uniq` means another resolution on this chain reached `building`
  * first. It is the last line of the defence, it fires only when the lease has already failed, and
  * it must be caught rather than propagated — the correct response is "not my turn", not an alarm.
- * `micro-settlement/src/outbound.ts:377-380`, verbatim in intent.
+ * `micro-settlement/src/outbound.ts`, verbatim in intent.
  */
 export function isInFlightConflict(err: unknown): boolean {
   const e = err as { code?: unknown; constraint_name?: unknown }

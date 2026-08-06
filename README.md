@@ -163,11 +163,11 @@ This is the one surprising thing in the codebase, so it is written down twice �
 
 The oracle key lives in `micro-custody`, which is a signing **policy** rather than a signing oracle.
 An EVM address of purpose `deployer` may sign a zero-value contract CREATION and nothing else
-(`custody/src/signing.ts:210-231`). **There is no purpose in custody today whose EVM shape is "call
+(`custody/src/signing.ts`). **There is no purpose in custody today whose EVM shape is "call
 a contract with calldata"**: `SIGNABLE_PURPOSES` is `{deployer, treasury, deposit}`
-(`custody/src/gates.ts:35`), `transfer` requires empty calldata and says in terms that widening it
-would turn the key into a signing oracle (`custody/src/signing.ts:239-245`), and
-`custody_keys_purpose_ck` will not even store a fourth purpose (`custody/src/migrations.ts:117`).
+(`custody/src/gates.ts`), `transfer` requires empty calldata and says in terms that widening it
+would turn the key into a signing oracle (`custody/src/signing.ts`), and
+`custody_keys_purpose_ck` will not even store a fourth purpose (`custody/src/migrations.ts`).
 
 That refusal is right, and it is not this repository's to overturn. So the oracle acts the only way
 custody will let it act: it **creates a one-shot `ForesightResolver`** whose constructor calls
@@ -359,14 +359,14 @@ ordinary bettor with a *published* address (`FORESIGHT_HOUSE_ADDRESS`, disclosed
 platform miners' coinbases are — 21 §3). It stakes through the same `stake(uint8)` everyone uses,
 its position is mirrored into `positions` like anyone's, the contract's `payoutOf` counts it like
 anyone's, and its winnings return through `claim()`/`claimFor()`
-(`src/contracts/ForesightMarket.sol:431-437`) — so **settlement composes rather than forks**:
+(`src/contracts/ForesightMarket.sol`) — so **settlement composes rather than forks**:
 there is no house-specific path in resolution, settlement or payout, because the house is not a
 special case anywhere on chain.
 
 That is also the only design custody admits, and it is worth stating rather than discovering:
 `stake(uint8)` is a value-bearing contract CALL, and custody's three EVM shapes are creation
-(value must be zero — `custody/src/signing.ts:210-227`), plain value transfer (data must be empty
-— `:231-260`) and sweep. None of them can call a contract with value; it is the same constraint
+(value must be zero — `custody/src/signing.ts`), plain value transfer (data must be empty
+—) and sweep. None of them can call a contract with value; it is the same constraint
 that makes the oracle act through a constructor. So the house key lives outside this estate's
 custody, and a seeder *contract* is refused on its own terms: the contract would be the staker,
 and its winnings would strand at an address with no key.
@@ -417,7 +417,7 @@ improvise.
   because the bullet claimed a gap that no longer exists. `GET /markets/:id` serves the sentence,
   the amounts, the address and the on-chain evidence hashes, and `micro-foresight-web` renders all
   of it above the ratio bar: `foresight-web/src/components/houseseed.tsx`, mounted at
-  `foresight-web/src/pages/market.tsx:271`. The client re-derives symmetry and pool share rather
+  `foresight-web/src/pages/market.tsx`. The client re-derives symmetry and pool share rather
   than repeating them, and renders a loud alarm if the numbers do not support the sentence. 21
   §7.6's proof is held in full.
 
@@ -429,13 +429,13 @@ the engagement-treasury wave; corrected here in the same change, because two of 
 this repository's own:
 
 1. `subject: 'chain:<id>'` was not in the account grammar — `parseAccountSubject` threw inside the
-   ledger's `ensureAccount` (`ledger/src/accounts.ts:104`). **Fixed at the root** in
+   ledger's `ensureAccount` (`ledger/src/accounts.ts`). **Fixed at the root** in
    `micro-contracts`: the subject was the right one and the grammar now registers it.
 2. `purpose: 'clearing'` is a *type*, not a purpose — `accounts_purpose_chk`
-   (`ledger/src/migrations.ts:130`) refuses it. The transit purpose is `suspense`; the type stays
+   (`ledger/src/migrations.ts`) refuses it. The transit purpose is `suspense`; the type stays
    `clearing`, which is also what lets the account sit either side of zero.
 3. `kind: 'foresight.settlement_fee'` was not in the ledger's closed `journal_entries_kind_chk`
-   list (`ledger/src/migrations.ts:181`). The vocabulary is closed precisely so revenue reports
+   list (`ledger/src/migrations.ts`). The vocabulary is closed precisely so revenue reports
    can count on it; the right name in it is `fee_charged`.
 
 Nothing needed reconciling — there is no public network yet, so no entry had ever posted. The

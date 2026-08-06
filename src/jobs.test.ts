@@ -409,7 +409,7 @@ test('a fee is reported to the ledger from an indexed event, once', { skip }, as
   assert.equal(posted.length, 1)
   const entry = posted[0]
   // 'fee_charged' — the ledger's closed journal_entries_kind_chk vocabulary
-  // (ledger/src/migrations.ts:181). The previous expectation pinned a kind the ledger refuses,
+  // (ledger/src/migrations.ts). The previous expectation pinned a kind the ledger refuses,
   // which is a test asserting the defect; corrected with the posting fix in ledgerclient.ts.
   assert.equal(entry?.kind, 'fee_charged')
   // The key is derived from the market id, so a retry replays rather than posting twice.

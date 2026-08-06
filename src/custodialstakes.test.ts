@@ -82,7 +82,7 @@ const TWO_THOUSAND_FOUR_HUNDRED_EMBER = '2400000000000000000000'
  * The asset that is still OFF, and the one the "disabled" tests are pointed at.
  *
  * Named once because it moved: these tests used LTC, whose blocker is gone (migration 10). USDT
- * on Ethereum is the row whose recorded reason is STILL TRUE — `pricing/src/rates.ts:57` derives
+ * on Ethereum is the row whose recorded reason is STILL TRUE — `pricing/src/rates.ts` derives
  * its quoted set from `ON_CHAIN_ASSETS`, which holds `AssetCode`s only, and the live service
  * answers 404 for this urn. A real seeded row rather than a fixture invented for the test, so
  * these assertions exercise the registry the deploy actually creates; and if USDT is ever priced
@@ -302,7 +302,7 @@ test('a quote in a disabled asset is refused with the reason, not silently price
   })
   assert.equal(response.status, 409)
   assert.equal(response.body['error']?.['code'], 'asset_disabled')
-  // The registry is consulted BEFORE pricing (`server.ts:770-784`), so the reader gets the
+  // The registry is consulted BEFORE pricing (`server.ts`), so the reader gets the
   // platform's own sentence rather than "the rate board is having a bad minute".
   // MUTATION: move the `!asset.enabled` check below the `stakeRates` call → the read happens and
   // this reddens, even though the status code and the error code are unchanged.

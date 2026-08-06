@@ -260,7 +260,7 @@ test('the oracle posts by creating a resolver at the address the market will der
   assert.ok(row.rawTx)
 
   // **NO NEW SIGNING PATH.** The signature is a `deployer`-purpose zero-value creation, which is
-  // the one shape custody already signs (`custody/src/signing.ts:210-231`).
+  // the one shape custody already signs (`custody/src/signing.ts`).
   assert.equal(custody.signed.length, 1)
   const request = custody.signed[0]
   assert.equal(request?.purpose, 'deployer')

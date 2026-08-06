@@ -54,7 +54,7 @@ export function familyOf(chain: ChainId): ChainFamily {
  *
  * Never defaulted. A transaction signed with no chain id is replayable on every EVM network, and a
  * transaction signed with the WRONG one deploys a market to a chain the operator did not choose.
- * Custody refuses a chain-id-less signature at gate 3 (`custody/src/keys.ts:293`); this is the same
+ * Custody refuses a chain-id-less signature at gate 3 (`custody/src/keys.ts`); this is the same
  * refusal on the near side, where the error message can still be useful.
  */
 export function chainIdOf(chain: ChainId, network: Network): number {

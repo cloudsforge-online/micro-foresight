@@ -4,7 +4,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * ## The defect
  *
- * `FORESIGHT_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts:28`).
+ * `FORESIGHT_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts`).
  * The composition root read it once, at import — `const token = () => env.serviceToken` — and handed
  * that to all five upstream clients. This service's custody calls come from **leased background
  * jobs**: `market.deploy` provisions a per-market deployer address and signs a contract creation,
@@ -97,7 +97,7 @@ const CREDENTIAL = 'cfsc_5ntCPqB0ZQ3xk1r-8LHYyU2eWvJfA6oMdT4siGXn9Kc'
 /** What `FORESIGHT_SERVICE_TOKEN` is today: a bearer this process cannot renew. */
 const STATIC_TOKEN_SCOPES = ['custody:address:create', 'custody:sign:deployer']
 
-/** identity/src/tokens.ts:28. Unchanged by this fix, and it must stay unchanged — rotation IS expiry. */
+/** identity/src/tokens.ts. Unchanged by this fix, and it must stay unchanged — rotation IS expiry. */
 const SERVICE_TTL_SECONDS = 600
 
 /** jobs.ts:recurringJobs — `deploy.sweep`. The number that makes the one above a defect. */

@@ -29,11 +29,11 @@
  *
  * ## Routes, verified
  *
- * `POST /decisions` — `micro-policy/src/server.ts:338`. Note it is UNPREFIXED. Policy serves
+ * `POST /decisions` — `micro-policy/src/server.ts`. Note it is UNPREFIXED. Policy serves
  * `/decisions`, `/decisions/:id`, `/subjects/:subject/decisions`, `/rules`, `/freezes` and the
  * three health endpoints, and nothing under `/v1` at all.
  *
- * The scope is `policy:decide` (`policy/src/server.ts:83`), and a user token can never reach the
+ * The scope is `policy:decide` (`policy/src/server.ts`), and a user token can never reach the
  * route — `requireScope` is false for anything that is not a service, deliberately, because
  * deciding on your own behalf is not a thing policy offers.
  */
@@ -56,7 +56,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * The consequence is not a 403 on one call. `micro-deploy`'s `derive-grants.mjs` reads this
  * constant into `IDENTITY_SERVICE_TOKEN_GRANTS`, and identity validates that list against the
  * registry at import and REFUSES TO START on a name it does not know
- * (`identity/src/env.ts:141`). An unregistered demand here is a dead identity container, and
+ * (`identity/src/env.ts`). An unregistered demand here is a dead identity container, and
  * therefore no tokens for anybody.
  *
  * ── AND `LiveScope` RATHER THAN `Scope` ───────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  *
  * `LiveScope = Exclude<Scope, DeprecatedScope>`, and `DeprecatedScope` is computed FROM `SCOPES`
  * by a conditional type over the `deprecated` field rather than hand-listed
- * (`contracts/packages/auth/src/index.ts:507`), so it cannot drift from the registry — a
+ * (`contracts/packages/auth/src/index.ts`), so it cannot drift from the registry — a
  * hand-written companion list is the failure that package keeps catching.
  *
  * `Scope` deliberately keeps its wide meaning and this does not narrow it: a token arriving from
@@ -89,7 +89,7 @@ export interface PolicyVerdict {
 }
 
 export interface StakePolicyInput {
-  /** `user:<id>` — policy's own subject spelling (`policy/src/server.ts:94`). */
+  /** `user:<id>` — policy's own subject spelling (`policy/src/server.ts`). */
   readonly subject: string
   readonly marketId: string
   /** The intended stake, as a decimal string in whole EMBER. Never a number: see below. */
@@ -109,7 +109,7 @@ export interface PolicyClientOptions {
    * The registered action name to decide under.
    *
    * Policy's registry is CLOSED — an unregistered action is a 400, never a guess
-   * (`policy/src/actions.ts:32-38`). There is no `foresight.stake` in it today and this task may
+   * (`policy/src/actions.ts`). There is no `foresight.stake` in it today and this task may
    * not modify that repository, so the deployment names an action that IS registered. See
    * `env.ts`'s `policyAction` for the default and why it was chosen.
    */
@@ -160,7 +160,7 @@ export function httpPolicyClient(options: PolicyClientOptions): PolicyClient {
             context: {
               // A DECIMAL STRING, and policy refuses anything else — it rejects a JSON number
               // outright rather than coercing, because a threshold comparison on a float is the
-              // bug that service exists to not have (`policy/src/server.ts:667-673`).
+              // bug that service exists to not have (`policy/src/server.ts`).
               amount: input.amount,
               asset: 'EMBER',
             },

@@ -33,7 +33,7 @@
  * a chain: `src/evm.ts` builds transactions, `src/deploy.ts` deploys a real contract, and a
  * market's `question_hash` really is written into it. An image is next to all of that on the same
  * page and shares none of it. Worse, the claim would be one nobody could ever see fail — there is
- * no Registry of Authorship on Hearth to check against. `tessera/src/kiln.ts:373-392` records that
+ * no Registry of Authorship on Hearth to check against. `tessera/src/kiln.ts` records that
  * the Solidity for it has never been written, `mint`'s catalogue deploys three ERC-20 variants and
  * nothing else, and studio's own `anchor.state` is `'unanchored'` on every asset it has ever
  * produced. A badge reading "verified on chain" beside a picture would therefore be a check that
@@ -46,12 +46,12 @@
  * The estate's single spelling for a content address: `sha256:` and 64 LOWERCASE hex.
  *
  * Exactly studio's (`studio/src/assets.ts`) and exactly tessera's `objects_checksum_shape`
- * (`tessera/src/migrations.ts:628` region), and duplicated into the schema as
+ * (`tessera/src/migrations.ts` region), and duplicated into the schema as
  * `markets_image_checksum_shape` / `ideas_image_checksum_shape` so it holds against a write path
  * that never reaches this file.
  *
  * Uppercase hex is REFUSED rather than lowered, and a bare hex with no prefix is refused rather
- * than prefixed. `tessera/src/itemasset.ts:45` makes the same refusal for the same reason: a
+ * than prefixed. `tessera/src/itemasset.ts` makes the same refusal for the same reason: a
  * function that normalised would be the one place two spellings of one image could be born, and
  * the two would then compare unequal everywhere else in the estate.
  */
@@ -109,7 +109,7 @@ export function parseImageReference(body: Record<string, unknown>): ImageReferen
 
 /**
  * The path studio serves an asset's bytes at, spelled exactly as studio spells it
- * (`studio/src/server.ts:585`).
+ * (`studio/src/server.ts`).
  *
  * **That route needs no Authorization header when the asset is public**, which is the whole reason
  * an image can be rendered at all: a browser sends no bearer token on an `<img src>`, so an

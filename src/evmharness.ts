@@ -15,7 +15,7 @@
  *     repository whose entire compile step is one 90-line script and one exact-pinned `solc`. The
  *     estate's rule is that a service has one build; this would give it two.
  *   * **A real Hearth node.** `micro-indexer` does exactly this and is right to — but its Hearth
- *     test SKIPS when no node is reachable (`indexer/src/hearth.test.ts:59`), and a suite whose
+ *     test SKIPS when no node is reachable (`indexer/src/hearth.test.ts`), and a suite whose
  *     contract invariants skip on the one machine that matters is a suite that proves nothing. CI
  *     has no chain.
  *   * **Not testing the contract.** Not available. It holds other people's money.

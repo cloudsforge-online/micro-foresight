@@ -4,13 +4,13 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * ## THE LEASED JOB AND THE TEN-MINUTE TOKEN
  *
- * `FORESIGHT_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts:28`).
+ * `FORESIGHT_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts`).
  * The composition root read it once, at import:
  *
- *     const token = () => env.serviceToken        // index.ts:101, for the life of the process
+ *     const token = () => env.serviceToken        // index.ts, for the life of the process
  *
- * and handed that one function to custody (`:104`), the indexer (`:109`), the ledger (`:114`),
- * policy (`:120`) and admin-api (`:242`). There was no `ServiceTokenProvider`, no
+ * and handed that one function to custody, the indexer, the ledger,
+ * policy and admin-api. There was no `ServiceTokenProvider`, no
  * `POST /service-tokens/exchange` and no `cfsc_` anywhere in `src/` — checked by grep, not inferred.
  * So every outbound call this service makes authenticated **once per bootstrap** and never again.
  *
@@ -136,7 +136,7 @@ export interface Upstreams {
   readonly ledger: LedgerClient
   /**
    * The rate board. **Built with the plain `fetch`, not the authorised one**: `/rates/:asset` is
-   * unauthenticated by design (`pricing/src/server.ts:9`), and presenting a service token to a
+   * unauthenticated by design (`pricing/src/server.ts`), and presenting a service token to a
    * public endpoint would make this call fail whenever the credential was unavailable — coupling
    * a stake's price to an authentication path it does not need.
    */

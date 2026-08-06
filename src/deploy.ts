@@ -408,7 +408,7 @@ async function advance(deps: DeployDeps, claimed: Market): Promise<DriveResult> 
     orderId: market.id,
     payload: {
       // Legacy (type 0) only. Hearth's node has no EIP-1559 decoder, and custody refuses a 1559
-      // payload for an `ember`-family key outright (`custody/src/signing.ts:192-196`) — a type-2
+      // payload for an `ember`-family key outright (`custody/src/signing.ts`) — a type-2
       // transaction signed for that chain is not rejected by the network, it is bytes nothing on
       // it can parse.
       type: 0,

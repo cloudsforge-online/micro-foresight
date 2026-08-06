@@ -18,13 +18,13 @@
  * Every signature this service asks for is `purpose: 'deployer'`, which custody's policy binds to
  * the `creation` shape: `to` must be null, `value` must be zero, `data` must be non-empty creation
  * bytecode under EIP-3860's 49,152-byte ceiling, and the gas limit must lie in [21,000, 8,000,000]
- * (`custody/src/signing.ts:210-231`). A deployer address therefore CANNOT transfer, cannot call a
+ * (`custody/src/signing.ts`). A deployer address therefore CANNOT transfer, cannot call a
  * contract and cannot mint, whoever holds the credential.
  *
  * **There is no purpose in custody today whose EVM shape is "call a contract".** `SIGNABLE_PURPOSES`
- * is `{deployer, treasury, deposit}` (`custody/src/gates.ts:35`); `transfer` requires empty
+ * is `{deployer, treasury, deposit}` (`custody/src/gates.ts`); `transfer` requires empty
  * calldata and says in terms that widening it would turn the key into a signing oracle
- * (`custody/src/signing.ts:239-245`); and `custody_keys_purpose_ck` (`custody/src/migrations.ts:117`)
+ * (`custody/src/signing.ts`); and `custody_keys_purpose_ck` (`custody/src/migrations.ts`)
  * will not even store a fourth purpose. That refusal is right and it is not this repository's to
  * overturn — so the ORACLE acts by creating a contract too. See `ForesightMarket._isOracle` for how
  * the market recognises it, and `resolve.ts` for the mechanics.
@@ -34,7 +34,7 @@
  *
  * `POST /v1/sign` takes SEVEN identity fields — `address`, `chain`, `network`, `family`, `purpose`,
  * `userId`, `orderId` — and compares all seven, character for character, against the row it holds
- * (`custody/src/gates.ts:120-137`). Getting any one of them wrong is a 403 `binding_mismatch` whose
+ * (`custody/src/gates.ts`). Getting any one of them wrong is a 403 `binding_mismatch` whose
  * message deliberately does NOT say which field disagreed, because naming it would be an oracle a
  * caller could walk one field at a time. So a caller cannot debug a mismatch from the response; it
  * has to be right by construction instead.

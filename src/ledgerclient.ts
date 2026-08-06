@@ -94,14 +94,14 @@ export interface LedgerClient {
  * ledger's source). As first shipped, every fee report was refused by the ledger THREE ways:
  *   1. subject `chain:<id>` was not in the account grammar — `parseAccountSubject`
  *      (contracts/packages/money/src/index.ts) threw inside the ledger's `ensureAccount`
- *      (ledger/src/accounts.ts:104). Fixed at the ROOT: the grammar now registers `chain:<id>`,
+ *      (ledger/src/accounts.ts). Fixed at the ROOT: the grammar now registers `chain:<id>`,
  *      because the subject was the right one.
  *   2. purpose `'clearing'` is a TYPE, not a purpose — `accounts_purpose_chk`
- *      (ledger/src/migrations.ts:130) refuses it. The transit purpose is `'suspense'`; the type
+ *      (ledger/src/migrations.ts) refuses it. The transit purpose is `'suspense'`; the type
  *      stays `'clearing'`, which is also what lets the account sit either side of zero
  *      (ledger's overdraft trigger exempts type `clearing`).
  *   3. the entry kind `'foresight.settlement_fee'` was not in the ledger's closed
- *      `journal_entries_kind_chk` list (ledger/src/migrations.ts:181) — the vocabulary is closed
+ *      `journal_entries_kind_chk` list (ledger/src/migrations.ts) — the vocabulary is closed
  *      precisely so revenue reports can count on it, and the right name in it is `'fee_charged'`.
  * No entry had ever posted (there is no public network yet), so nothing needed reconciling.
  */

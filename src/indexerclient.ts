@@ -22,7 +22,7 @@
  *   `GET  /v1/transactions/:chain/:network/:hash`           line 319 — carries `logs`
  *   `GET  /v1/chains/:chain/:network/status`                line 317 — the tip, for `asOf`
  *
- * Both the `/v1` and unprefixed forms are served (`indexer/src/server.ts:124`), and `/v1` is the
+ * Both the `/v1` and unprefixed forms are served (`indexer/src/server.ts`), and `/v1` is the
  * estate convention and the one used here.
  *
  * ## Why the mirror needs two calls per transaction

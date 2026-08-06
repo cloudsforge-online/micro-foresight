@@ -11,13 +11,13 @@
  *
  *   1. **For three of the four assets asked for, "a pool per asset" is not a pool.** The pool is
  *      the contract's own balance on Hearth — `uint256[2] public pool` at
- *      `src/contracts/ForesightMarket.sol:123`, fed by `msg.value` at `:197-206`. Bitcoin and
+ *      `src/contracts/ForesightMarket.sol`, fed by `msg.value`. Bitcoin and
  *      Litecoin have no contracts at all; USDT lives on Ethereum, where no `ForesightMarket` is
  *      deployed and to which no bridge exists or should. So a BTC pool could only ever be a number
  *      the PLATFORM holds and promises to divide — and that spends the single strongest property
  *      this product has: `claim()` reads nothing but the contract's own storage, so "if every
  *      server this platform owns is switched off, a winner with a wallet and a block explorer can
- *      still be paid" (`ForesightMarket.sol:421-425`). Liquidity fragmentation is the cheap
+ *      still be paid" (`ForesightMarket.sol`). Liquidity fragmentation is the cheap
  *      objection to a pool per asset. **Losing the trustless payout is the expensive one**, and it
  *      is the one 29-native-assets.md §6.1 did not price when it listed the option.
  *
@@ -37,8 +37,8 @@
  *
  * Today a BTC holder cannot reach this product at all, for two independent and verified reasons:
  * the stake is `wallet → contract` and needs an EMBER-holding key the user controls
- * (`src/server.ts:576-586`, "not one wei passes through here"), and custody will not sign for a
- * user — `SIGNABLE_PURPOSES` is `{deployer, treasury, deposit}` at `custody/src/gates.ts:65` and
+ * (`src/server.ts`, "not one wei passes through here"), and custody will not sign for a
+ * user — `SIGNABLE_PURPOSES` is `{deployer, treasury, deposit}` at `custody/src/gates.ts` and
  * must stay that way. So a custodial stake is a LEDGER ENTRY, not a signing capability: the
  * platform stakes the converted EMBER on chain from its own published address, exactly as the
  * house seed already does (`src/houseseed.ts`), and the per-user share lives in
@@ -215,11 +215,11 @@ export function stakeAssetDecimals(code: StakeAssetCode, tokenDecimals?: number)
  * **TWO RATES, NOT ONE, AND THAT IS A DELIBERATE IMPROVEMENT ON THE PRECEDENT.**
  *
  * `micro-billing` records one `rate_usd_scaled` beside its two amounts
- * (`billing/src/migrations.ts:623-629`) and that is right for billing, whose pair is (US cents,
+ * (`billing/src/migrations.ts`) and that is right for billing, whose pair is (US cents,
  * EMBER) with USD as the numeraire — one rate closes the arithmetic.
  *
  * Here the pair is (BTC, EMBER) and `micro-pricing` publishes no BTC/EMBER rate: it publishes USD
- * per whole coin, per asset (`pricing/src/server.ts:321`). The cross rate is therefore a QUOTIENT
+ * per whole coin, per asset (`pricing/src/server.ts`). The cross rate is therefore a QUOTIENT
  * of two published numbers, and storing only the quotient would lose which leg moved — an auditor
  * could confirm the division and could not confirm either input against pricing's own history.
  * So both legs are stored, and `poolAmountFor` is a pure function of exactly what is on the row.
@@ -228,7 +228,7 @@ export function stakeAssetDecimals(code: StakeAssetCode, tokenDecimals?: number)
 export interface StakeRates {
   /** Mid-market USD per one whole unit of the staked asset, at `RATE_SCALE`. */
   readonly stakeUsdScaled: bigint
-  /** Mid-market USD per one whole EMBER, at `RATE_SCALE`. Administered — `pricing/src/rates.ts:55`. */
+  /** Mid-market USD per one whole EMBER, at `RATE_SCALE`. Administered — `pricing/src/rates.ts`. */
   readonly poolUsdScaled: bigint
 }
 
@@ -364,7 +364,7 @@ export function formatUnits(amount: bigint, decimals: number): string {
  * The sentence a bettor reads before they stake, composed HERE so every client shows the same one.
  *
  * The house seed's disclosure is composed the same way and for the same reason
- * (`houseseed.ts:230`): a disclosure each client improvises is a disclosure that differs between
+ * (`houseseed.ts`): a disclosure each client improvises is a disclosure that differs between
  * clients. 29 §6.3 asks for these words specifically, and they are the words rather than a
  * footnote because the thing being disclosed is that the user's FX exposure ENDS here.
  */

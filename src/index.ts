@@ -380,7 +380,7 @@ const jobDeps: JobDeps = {
 // container boot, because the relay only ever ran once, at start.
 //
 // `completed` is emitted after `complete()` has resolved, so it is the first moment the row is
-// provably gone and an enqueue can insert rather than conflict. `ledger/src/jobs.ts:132-137` names
+// provably gone and an enqueue can insert rather than conflict. `ledger/src/jobs.ts` names
 // this trap and this is its fix, unchanged; six services already do it this way and there is no
 // reason for a seventh pattern.
 // ────────────────────────────────────────────────────────────────────────────────────────────────

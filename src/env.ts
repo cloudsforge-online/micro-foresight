@@ -172,7 +172,7 @@ function optionalOrUndefined(source: Source, name: string): string | undefined {
 /**
  * An optional absolute origin — scheme and host, nothing else.
  *
- * `tessera/src/env.ts:144`'s verbatim, because the value is used the same way: concatenated with a
+ * `tessera/src/env.ts`'s verbatim, because the value is used the same way: concatenated with a
  * path to form a URL. A trailing slash or a stray path segment would produce `…/v1//v1/assets/…`
  * or `…/studio/v1/assets/…`, and both fail as a broken image on a user's page rather than at boot.
  * Refusing at boot is what turns a configuration typo into a fatal log line with the value in it.
@@ -292,7 +292,7 @@ export interface Env {
    * Where a service token is minted. `IDENTITY_ISSUER` unless overridden.
    *
    * Defaulted to the issuer rather than made a separate required variable, because the issuer of a
-   * token is by definition where the token came from — ledger's reasoning (`ledger/src/env.ts:172`),
+   * token is by definition where the token came from — ledger's reasoning (`ledger/src/env.ts`),
    * and it means this fix needs no new URL in any deploy manifest.
    */
   readonly identityUrl: string
@@ -303,7 +303,7 @@ export interface Env {
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    * **THE TEN-MINUTE CLIFF, AND WHY IT BIT THIS SERVICE HARDER THAN MOST.**
    *
-   * `FORESIGHT_SERVICE_TOKEN` holds a token that lives **600 seconds** (`identity/src/tokens.ts:28`)
+   * `FORESIGHT_SERVICE_TOKEN` holds a token that lives **600 seconds** (`identity/src/tokens.ts`)
    * and `index.ts` read it once, at import: `const token = () => env.serviceToken`, handed verbatim
    * to all five `HttpClient`s. So this service authenticated to custody, the indexer, the ledger,
    * policy and admin-api **exactly once per bootstrap** and never again.
@@ -344,7 +344,7 @@ export interface Env {
    * refuses every rate read, so a non-EMBER stake answers 503 `rate_unavailable` and an EMBER
    * stake, which applies no rate, is untouched. Fail-closed either way.
    *
-   * The rate board is public (`pricing/src/server.ts:9`), so no credential is presented.
+   * The rate board is public (`pricing/src/server.ts`), so no credential is presented.
    */
   readonly pricingUrl: string | undefined
   readonly policyUrl: string
@@ -425,7 +425,7 @@ export interface Env {
    * The published platform address a CUSTODIAL market position is staked from — the house seed's
    * arrangement, for the house seed's reason: custody has no signing shape that calls
    * `stake(uint8)` and `SIGNABLE_PURPOSES` does not include `user`
-   * (`custody/src/gates.ts:65`), so a custodial bettor's EMBER reaches the pool through an
+   * (`custody/src/gates.ts`), so a custodial bettor's EMBER reaches the pool through an
    * address the platform publishes and funds, exactly as the seed does.
    *
    * **Absent is a supported mode**: this deployment takes wallet stakes only, and every custodial
@@ -444,7 +444,7 @@ export interface Env {
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    * **NOT `STUDIO_URL`, AND THE DIFFERENCE IS THE WHOLE POINT OF THE SEPARATE NAME.**
    *
-   * `tessera/src/env.ts:227` has `STUDIO_URL` and it is a SERVER-TO-SERVER address: tessera's own
+   * `tessera/src/env.ts` has `STUDIO_URL` and it is a SERVER-TO-SERVER address: tessera's own
    * process dials it with a service token, and in the estate it resolves to a container name on a
    * private compose network. A browser cannot reach that, ever. Reusing the name here would produce
    * an `<img src>` pointing at an address that exists only inside the cluster — which fails as a
@@ -502,9 +502,9 @@ export interface Env {
    * The policy action name staking is evaluated under.
    *
    * `micro-policy`'s action registry is CLOSED — an unregistered name is a 400, not a guess
-   * (`policy/src/actions.ts:88-165`). There is no `foresight.stake` in it and this task may not
+   * (`policy/src/actions.ts`). There is no `foresight.stake` in it and this task may not
    * modify that repository, so the default is the registered action whose description actually
-   * fits ("Place an order. Soft per-window caps only." — `policy/src/actions.ts:143-147`). When
+   * fits ("Place an order. Soft per-window caps only." — `policy/src/actions.ts`). When
    * policy next gains a `foresight.stake` action, this variable is how a deployment moves to it
    * without a release here.
    */

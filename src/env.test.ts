@@ -324,7 +324,7 @@ test('parseNetwork is closed', () => {
 test('this service reads exactly one database variable, and it is its own', () => {
   // The variable name is ASSEMBLED so this test does not itself trip the CI grep it agrees with.
   // `micro-market` had to do the same, and the org workflow was later fixed to stop punishing a
-  // test that documents the rule (`micro-org/.github/workflows/service-ci.yml:299-311`).
+  // test that documents the rule (`micro-org/.github/workflows/service-ci.yml`).
   const foreignName = ['LEDGER', 'DATABASE', 'URL'].join('_')
   const foreignDsn = 'postgres://someone:else@host/ledger'
   const env = loadEnv({ ...MINIMAL, [foreignName]: foreignDsn })

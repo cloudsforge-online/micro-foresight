@@ -11,7 +11,7 @@
  *
  * Three specific traps, each one a defect this estate has actually shipped somewhere:
  *
- *   1. **`usable: false` is served as a 200** (`pricing/src/server.ts:321-329` — "a 404 would be a
+ *   1. **`usable: false` is served as a 200** (`pricing/src/server.ts` — "a 404 would be a
  *      lie about the asset existing and a 503 would suggest retrying will help"). So a status
  *      check alone reads an unusable rate as a usable one. **The flag is what is checked.**
  *   2. **`BigInt('') === 0n`.** A missing or empty `usdScaled` would become a rate of zero, and a
@@ -34,7 +34,7 @@
  *
  * ── THE ADMINISTERED LEG, SAID OUT LOUD ───────────────────────────────────────────────────────
  *
- * EMBER's rate is administered — `pricing/src/rates.ts:55`, `ADMINISTERED_ASSETS = ['EMBER']` —
+ * EMBER's rate is administered — `pricing/src/rates.ts`, `ADMINISTERED_ASSETS = ['EMBER']` —
  * because Hearth has no exchange listing. So one leg of every non-EMBER stake is a figure an
  * operator typed. This client cannot fix that and does not pretend to; what it does is make the
  * figure that was used a recorded fact on the stake row, so that editing it later restates nothing
@@ -42,8 +42,8 @@
  * governance, and 29 §6.4 is right that it goes to the owner.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
- * Route verified against the other side: `GET /rates/:asset` (`pricing/src/server.ts:321`),
- * unauthenticated by design (`pricing/src/server.ts:9`), body `{ rate: RateView }`.
+ * Route verified against the other side: `GET /rates/:asset` (`pricing/src/server.ts`),
+ * unauthenticated by design (`pricing/src/server.ts`), body `{ rate: RateView }`.
  */
 
 import { HttpClient, HttpError } from '@cloudsforge/http'

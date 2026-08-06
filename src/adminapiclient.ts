@@ -26,8 +26,8 @@
  *
  * ## Route, verified
  *
- * `GET /v1/engagement/policies` — `admin-api/src/server.ts:956`. Its guard is `requireReader`
- * (`admin-api/src/server.ts:481`): a SERVICE token must hold the exact scope `admin:read` —
+ * `GET /v1/engagement/policies` — `admin-api/src/server.ts`. Its guard is `requireReader`
+ * (`admin-api/src/server.ts`): a SERVICE token must hold the exact scope `admin:read` —
  * admin-api matches scopes exactly, §3.3h, so `admin:*` will not do. The scope is registered in
  * `contracts/packages/auth` ('admin:read', citing the gate). The response carries `policies`
  * (per-service rows) and `ceilings`.

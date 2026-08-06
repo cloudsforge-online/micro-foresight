@@ -2,7 +2,7 @@
  * Run a mutating operation at most once per key.
  *
  * **The shape is `micro-ledger`'s `src/idempotency.ts`**, which took it in turn from
- * `repos/forge-pay/services/pay/src/store.ts:153`. It is inherited rather than reinvented, and what
+ * `repos/forge-pay/services/pay/src/store.ts`. It is inherited rather than reinvented, and what
  * it gets right is preserved in full:
  *
  *   1. **The claim INSERT and the work share ONE transaction.** The stored response can therefore

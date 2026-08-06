@@ -8,8 +8,8 @@
  *
  *   1. **Custody cannot sign a stake.** `stake(uint8)` is a value-bearing contract CALL, and
  *      custody's three EVM shapes are creation (value must be zero —
- *      `custody/src/signing.ts:210-227` `assertCreation`), plain value transfer (data must be
- *      empty — `:231-260` `assertTransfer`), and sweep. `foresight/src/custodyclient.ts:24-28`
+ *      `custody/src/signing.ts` `assertCreation`), plain value transfer (data must be
+ *      empty — `assertTransfer`), and sweep. `foresight/src/custodyclient.ts`
  *      already records that no purpose's shape is "call a contract" — it is why the oracle acts
  *      through a constructor (`ForesightResolver`). A resolver-style seeder contract would make
  *      the CONTRACT the staker, and its winnings would strand at a keyless address. So the seed
@@ -20,7 +20,7 @@
  *   2. **Settlement composes because nothing forks.** The house address is an ordinary staker:
  *      its position is mirrored by `mirror.ts` like anyone's, the contract's `payoutOf` counts it
  *      like anyone's, and after resolution its winnings come back through `claim()`/`claimFor()`
- *      (`src/contracts/ForesightMarket.sol:431-437`) — `claimFor` exists precisely so a batching
+ *      (`src/contracts/ForesightMarket.sol`) — `claimFor` exists precisely so a batching
  *      job can push a payout to a staker. From the house address the EMBER returns to the
  *      engagement account the way 21 §3 says everything does: through the front door — deposit,
  *      indexer confirmation, conversion — "like any bettor's", literally.

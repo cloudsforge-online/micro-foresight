@@ -158,7 +158,7 @@ export interface ServerDeps {
   /**
    * The published platform address a custodial market position is staked from on chain — the
    * house seed's arrangement, for the house seed's reason (`houseseed.ts`, and
-   * `custody/src/gates.ts:65`, which does not sign for a user and must not learn to).
+   * `custody/src/gates.ts`, which does not sign for a user and must not learn to).
    *
    * Undefined is a supported mode: this deployment takes wallet stakes only, and every custodial
    * route refuses plainly rather than half-working.
@@ -866,7 +866,7 @@ function buildRoutes(): Route[] {
      * The file header used to say there was no such route, and for the self-custody path there
      * still is not — `stake-intent` hands a wallet some calldata and nothing else. But a BTC
      * holder has no EMBER key and custody will not sign for them
-     * (`custody/src/gates.ts:65`, and widening it is refused), so their stake has to be an entry
+     * (`custody/src/gates.ts`, and widening it is refused), so their stake has to be an entry
      * in the ledger. No key is created here. Nothing here signs. The platform's aggregate position
      * reaches the chain from its own published address, afterwards, exactly as the house seed does.
      *
@@ -1403,7 +1403,7 @@ function buildRoutes(): Route[] {
      * into a deployed contract and a bettor can recompute it; an image checksum is a value studio
      * measured and a client relayed here, which this service never re-measures. `images.ts` sets
      * out the full argument, including why the false version of this claim would be undetectable:
-     * Hearth has no Registry of Authorship to check against (`tessera/src/kiln.ts:373-392` records
+     * Hearth has no Registry of Authorship to check against (`tessera/src/kiln.ts` records
      * that the Solidity was never written) and studio's `anchor.state` is `'unanchored'` on every
      * asset it has produced.
      *

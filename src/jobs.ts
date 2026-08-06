@@ -46,11 +46,11 @@
  * that as the design. **All five were undone a moment later by the runner**, and the mechanism is
  * three lines of `@cloudsforge/jobs`:
  *
- *   * `JobQueue.enqueue` is `insert … on conflict (kind, key) do nothing` (`jobs/src/index.ts:153`).
+ *   * `JobQueue.enqueue` is `insert … on conflict (kind, key) do nothing` (`jobs/src/index.ts`).
  *     The row it conflicts with is the handler's OWN row, which is still there, claimed and locked.
  *     So the self-enqueue never inserts anything — it updates, or ignores, the row already present.
- *   * `JobRunner.#run` then calls `queue.complete(job.id)` (`jobs/src/index.ts:407`), and `complete`
- *     is `delete from jobs where id = $1` (`:223`).
+ *   * `JobRunner.#run` then calls `queue.complete(job.id)` (`jobs/src/index.ts`), and `complete`
+ *     is `delete from jobs where id = $1`.
  *   * The row the reschedule "created" and the row the delete removes **are the same row**.
  *
  * Net effect: every background thing this service does ran exactly once per boot and then never
@@ -64,7 +64,7 @@
  * is one that drives a real `JobRunner` through a whole claim → run → complete cycle and then looks
  * for the row. That is `jobs.test.ts`'s `THE PROPERTY: a recurring row SURVIVES its own completion`.
  *
- * `ledger/src/jobs.ts:132-137` names this trap and gives the fix, and it is the one used here rather
+ * `ledger/src/jobs.ts` names this trap and gives the fix, and it is the one used here rather
  * than a third pattern: a recurring job is **a boot seed plus a re-arm driven by the runner's
  * `completed` event**, which is the only point at which the row is provably gone. `recurringJobs`
  * below is the table, `seedRecurring` is the seed, `rescheduleRecurring` is the re-arm.
@@ -414,7 +414,7 @@ export function feeReportHandler(deps: JobDeps): Handler {
       try {
         const entry = await deps.ledger.postEntry({
           // 'fee_charged', from the ledger's CLOSED kind vocabulary (journal_entries_kind_chk,
-          // ledger/src/migrations.ts:181). The original 'foresight.settlement_fee' was not in the
+          // ledger/src/migrations.ts). The original 'foresight.settlement_fee' was not in the
           // list and every report died at the constraint — see feePostings' header in
           // ledgerclient.ts for the full finding.
           kind: 'fee_charged',
@@ -546,7 +546,7 @@ export async function seedRecurring(queue: JobQueue, deps: ScheduleDeps): Promis
  *
  * **It cannot re-arm itself from inside its own handler**, and this function exists because for the
  * whole life of this service it tried to. The runner deletes the row on success AFTER the handler
- * returns (`jobs/src/index.ts:407` → `:223`), and `enqueue` conflicts on `(kind, key)` against the
+ * returns (`jobs/src/index.ts` →), and `enqueue` conflicts on `(kind, key)` against the
  * handler's own still-present row — so a self-enqueue was annihilated by the delete that followed
  * it and the schedule stopped dead at the first completion. The `completed` event is emitted after
  * `complete()` resolves, which is the only point at which the row is provably gone.

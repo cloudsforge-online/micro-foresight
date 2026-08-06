@@ -163,7 +163,7 @@ async function call(
 test('the checksum shape is studio’s, and nothing is normalised into it', () => {
   assert.ok(IMAGE_CHECKSUM.test(CHECKSUM))
   // Uppercase is REFUSED rather than lowered. A normaliser here would be the one place two
-  // spellings of one image could be born — tessera/src/itemasset.ts:45 refuses for the same reason.
+  // spellings of one image could be born — tessera/src/itemasset.ts refuses for the same reason.
   assert.ok(!IMAGE_CHECKSUM.test(`sha256:${'AB'.repeat(32)}`))
   // A bare hex is refused rather than prefixed.
   assert.ok(!IMAGE_CHECKSUM.test('ab'.repeat(32)))
@@ -536,7 +536,7 @@ test('no response describes an image as verified, attested, on-chain or anchored
   // read a hex digest as an on-chain fact — `questionHash` two fields away IS one. An image
   // checksum is not: studio measured it, a client relayed it, and this service never re-measures
   // it. Worse, the false claim would be undetectable — Hearth has no Registry of Authorship
-  // (`tessera/src/kiln.ts:373-392` records the Solidity was never written) and studio's
+  // (`tessera/src/kiln.ts` records the Solidity was never written) and studio's
   // `anchor.state` is `'unanchored'` on every asset. A badge that always passes is worse than no
   // badge, on a platform that custodies real money.
   // ══════════════════════════════════════════════════════════════════════════════════════════════
