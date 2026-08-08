@@ -47,8 +47,30 @@
  */
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
+import { NO_SCOPES_REQUIRED } from '@cloudsforge/contracts-auth'
 import { RATE_SCALE } from '@cloudsforge/contracts-chain'
 import { POOL_ASSET, type StakeAssetCode, type StakeRates } from './stakeassets.ts'
+
+/**
+ * Nothing, and this module is not being modest about it: **it presents no credential at all.**
+ *
+ * `httpPricingClient` builds its `HttpClient` with a base url, a name and a deadline and no `token`
+ * option (:104), because the one route it calls — `GET /rates/:asset` — is ungated by design
+ * (`pricing/src/server.ts`; the rate board is public). There is no bearer to scope.
+ *
+ * It is declared anyway because `micro-deploy`'s `derive-grants.mjs` reads this file as one that
+ * presents a credential. Its discriminator is `new HttpClient(` **and** a bearer word anywhere in
+ * the file (`NAMES_A_BEARER`, derive-grants.mjs:280), and this file says "token" twice in prose
+ * about the `TOKEN:` asset urn — "a token stake asset cannot be priced until it does". The
+ * whole-file test is deliberately loose and should stay that way: narrowing it to the constructor
+ * call once missed `admin-api/src/upstreams.ts`, which attaches its bearer sixteen lines later, and
+ * a false negative there produced no grant at all rather than a wrong one.
+ *
+ * So the module that knows the answer states it, which is the arrangement everywhere else in this
+ * estate. `NO_SCOPES_REQUIRED` rather than a bare `Object.freeze([])`: both are the same value and
+ * only one of them reads as a decision.
+ */
+export const PRICING_SCOPES = NO_SCOPES_REQUIRED
 
 /** A rate could not be obtained, or could not be trusted. Always refuses; never falls back. */
 export class RateUnavailableError extends Error {
