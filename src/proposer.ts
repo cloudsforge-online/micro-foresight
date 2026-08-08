@@ -34,8 +34,46 @@
 
 import { createHash } from 'node:crypto'
 import { HttpClient } from '@cloudsforge/http'
+import { NO_SCOPES_REQUIRED } from '@cloudsforge/contracts-auth'
 import { CATEGORIES, CATEGORY_VERSION } from './categories.ts'
 import type { IdeaSource, ProposalInput } from './ideas.ts'
+
+/**
+ * **None, and there is no scope in the estate that could apply to either peer.**
+ *
+ * This is the one token-bearing client in foresight whose peers are not CloudsForge services. Both
+ * `HttpClient`s below (:184, :191) are pointed at endpoints named in the environment — a web search
+ * API and a model endpoint — and the bearers they present, `searchToken` and `proposerToken`, are
+ * third-party API keys an operator pasted in. Neither is minted by `micro-identity`, neither is
+ * validated against `@cloudsforge/contracts-auth`, and neither is checked against any scope by the
+ * far end. Granting foresight something here would not change one byte that leaves this file; it
+ * would only put a real capability on a real token that nothing will ever consult, which is the
+ * least-privilege rule broken in the one direction that is silent (AD-05).
+ *
+ * The header above is why this is stable rather than an accident of the current deployment: there
+ * is no vendor name in this file and no vendor SDK in `package.json` deliberately, so the peers are
+ * whatever a deployment points them at, and "whatever a deployment points them at" is never
+ * something identity can mint for. Foresight's real outbound demands are declared by the modules
+ * that have the call sites — its admin-api, custody, indexer, ledger and policy clients — and are
+ * derived from those.
+ *
+ * It is stated out loud rather than left silent because `micro-deploy`'s `derive-grants.mjs` reads
+ * any module that builds an `HttpClient` and names a bearer ANYWHERE in the file as one presenting
+ * an estate credential (`NAMES_A_BEARER`, `deploy/scripts/derive-grants.mjs:280`), and by that test
+ * this file qualifies twice over. The test is deliberately loose and should stay that way:
+ * narrowing it to the constructor call once missed `admin-api/src/upstreams.ts`, which attaches its
+ * bearer sixteen lines after building the client, and a false negative there produces NO grant at
+ * all rather than a wrong one. So the module that knows the answer is the one that says it.
+ *
+ * Until now the answer lived in another repository. `micro-deploy` carried a hand-written entry for
+ * this file in `compose/estate/grant-gaps.json` reading `"scopes": []`, describing it as "the one
+ * token-bearing client in the estate whose peers are NOT CloudsForge services". That is a copy of a
+ * fact that lives here, and copies rot — the entry is deleted in the same window as this line
+ * lands, so the estate is never in a state where a gap is recorded for a module that no longer has
+ * one. `./pricingclient.ts:73` is the same verdict in this repository for the opposite reason: its
+ * peer IS a CloudsForge service, and the route it calls is ungated.
+ */
+export const PROPOSER_SCOPES = NO_SCOPES_REQUIRED
 
 /** What one pipeline run produced. `proposals` may be empty, and empty is not an error. */
 export interface ProposalRun {
