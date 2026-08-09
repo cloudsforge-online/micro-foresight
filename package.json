@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/foresight",
-  "version": "2.5.9",
+  "version": "2.5.12",
   "private": true,
   "description": "Forge Foresight: a parimutuel prediction market native to Hearth. The stake and the payout are the contract's; this service orchestrates the lifecycle, proposes questions for a person to approve, and mirrors the chain.",
   "license": "MIT",
