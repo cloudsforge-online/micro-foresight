@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import postgres from 'postgres'
 import { migrate, type Sql } from '@cloudsforge/db'
 import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION, TABLES } from './migrations.ts'
+import { STAKE_ASSET_REGISTRY } from './stakeassets.ts'
 import { enabled, openDb, skip } from './testsupport.ts'
 
 let sql: postgres.Sql
@@ -133,6 +134,66 @@ test('the in-flight indexes are PARTIAL, or they would forbid history', { skip }
     assert.match(row.indexdef, / WHERE /, `${row.indexname} is not partial`)
     assert.match(row.indexdef, /building/, `${row.indexname} does not start at 'building'`)
   }
+})
+
+/**
+ * The declared registry IS the seeded one — every column, both directions.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * WHAT THIS IS FOR (micro-org#291). `STAKE_ASSET_REGISTRY` is the only statement of "which assets
+ * can be staked" that exists outside a running database, and a file restating a table is worth
+ * nothing unless something compares them. This is that comparison, and it is deliberately made
+ * against a database built by the REAL migrations on an empty schema rather than against a fixture:
+ * the answer is the seed of migration 9 plus every UPDATE since, which is a fact only the migrator
+ * can produce.
+ *
+ * BOTH DIRECTIONS AND EVERY COLUMN. A row seeded and not declared is a promise the copy will
+ * under-state; a row declared and not seeded is a promise it will over-state, which is the whole of
+ * #291 — micro-site read `ON_CHAIN_ASSETS` and offered eight chains where four can be staked.
+ * `decimals` is compared because a registry that disagrees with `contracts-chain` sizes a stake
+ * wrongly by a power of ten, and `blocked_reason` because that sentence is SERVED to the user.
+ *
+ * MUTATION: enable LTC in the declaration and delete migration 10, or add a `stakeable('SOL', …)`
+ * row — this reddens naming the asset, and it is the only test that does.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('the declared stake registry IS the one the migrations seed', { skip }, async () => {
+  await migrate(sql as unknown as Sql, MIGRATIONS, { service: 'foresight-migrations-test' })
+
+  const rows = await sql<
+    { asset_code: string; decimals: number; display_name: string; enabled: boolean; blocked_reason: string | null }[]
+  >`
+    select asset_code, decimals, display_name, enabled, blocked_reason
+      from stake_assets order by asset_code
+  `
+  // Guards the whole comparison against passing on two empty sets, which is how a check like this
+  // usually fails to fail.
+  assert.ok(rows.length > 0, 'the migrations seeded no stake assets')
+
+  const seeded = rows.map((row) => ({
+    assetCode: row.asset_code,
+    decimals: row.decimals,
+    displayName: row.display_name,
+    enabled: row.enabled,
+    blockedReason: row.blocked_reason,
+  }))
+  const declared = [...STAKE_ASSET_REGISTRY]
+    .map((asset) => ({ ...asset }))
+    .sort((a, b) => (a.assetCode < b.assetCode ? -1 : 1))
+
+  // Named before the deep comparison, because "which asset" is the sentence somebody needs and a
+  // diff of five objects is not it.
+  assert.deepEqual(
+    seeded.map((a) => a.assetCode),
+    declared.map((a) => a.assetCode),
+    'stakeassets.ts and the migrations disagree about WHICH assets the registry holds',
+  )
+  assert.deepEqual(
+    seeded.filter((a) => a.enabled).map((a) => a.assetCode),
+    declared.filter((a) => a.enabled).map((a) => a.assetCode),
+    'stakeassets.ts and the migrations disagree about which assets are ENABLED',
+  )
+  assert.deepEqual(seeded, declared)
 })
 
 test('amounts are numeric(78,0) — never a float, never text', { skip }, async () => {

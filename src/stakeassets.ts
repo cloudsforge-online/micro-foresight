@@ -116,6 +116,136 @@ export interface StakeAsset {
   readonly blockedReason: string | null
 }
 
+/* ------------------------------------------------- what can actually be staked, written down */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE REGISTRY AS THIS SERVICE SHIPS IT — the one place outside a running database where the
+ * question "which assets can be staked?" has an answer.
+ *
+ * ── THE DEFECT THIS EXISTS FOR (micro-org#291) ────────────────────────────────────────────────
+ *
+ * micro-site's Foresight copy read "You can stake in any of the 8 chains the platform supports —
+ * EMBER, Bitcoin, Ethereum, Ethereum Classic, Litecoin, Dogecoin, Solana, XRP Ledger". Both halves
+ * were correctly DERIVED — from `contracts-chain`'s `ON_CHAIN_ASSETS`, which answers "which chains
+ * does the estate model" and not "which assets will Foresight take". Those were nearly the same
+ * set when the sentence was written. Measured 2026-08-09 against the live estate's own
+ * `stake_assets` table, they are off by four:
+ *
+ *     enabled   EMBER, BTC, ETH, LTC
+ *     disabled  TOKEN:eth:mainnet:0xdac1…  (Tether USD, with its reason)
+ *     absent    ETC, DOGE, SOL, XRP
+ *
+ * ETC, DOGE, SOL and XRP are not disabled rows carrying a reason. They are not rows at all, so a
+ * bettor who arrives with one is answered `404 unknown_asset` — "SOL is not a stake asset" — by a
+ * page that had just invited them by name. Being NAMEABLE by the estate and being ACCEPTED at the
+ * door are different facts, and only the second one belongs in a promise.
+ *
+ * The derivation is what makes it degrade: every chain `contracts` adds silently enlarges a promise
+ * this service has not made, with a green test suite each time.
+ *
+ * ── WHY THIS IS A DECLARATION AND NOT A SECOND HAND-TYPED LIST ────────────────────────────────
+ *
+ * `stake_assets` is the source and stays the source: `GET /stake-assets` serves it, and everything
+ * inside this service reads the table rather than this array. But a table lives in a database, and
+ * nothing outside this estate's network can read one — a bundle's build, a sibling repository's
+ * claims check, a person opening this repository. So the answer had to exist as a FILE as well, and
+ * a file that merely restates a table is the rot this issue is about.
+ *
+ * So it is checked, exhaustively and in both directions, against the table the real migrations
+ * produce on an empty database (`migrations.test.ts`, "the declared registry IS the seeded one").
+ * Add a row to a migration and not to this array, or the reverse, and that test goes red naming the
+ * asset. `stakeassets.test.ts` checks the shape a second way, against the two constraints migration
+ * 9 puts on the table, so this file cannot state something the schema would refuse.
+ *
+ * **WHAT IT DOES NOT CLAIM.** `enabled` is an operator switch — migration 9 says so in as many
+ * words: "turning either on is an UPDATE to this row once its blocker is gone, not a code change",
+ * and migration 10 is exactly that UPDATE for Litecoin. An operator may therefore flip a row in a
+ * live database without touching this repository, and no test here would know. So this declares
+ * what this service SHIPS as stakeable, which is the strongest statement a file in a repository can
+ * make and is the statement a reader outside the estate actually needs. A consumer that must know
+ * what one deployment is doing right now reads `GET /stake-assets` from that deployment.
+ *
+ * ── DECIMALS ARE NOT TYPED HERE ───────────────────────────────────────────────────────────────
+ *
+ * For a chain asset they come from the pinned package, the same way `CHAIN_DECIMALS` above takes
+ * them, because a registry that disagrees with `contracts-chain` sizes every stake in that asset
+ * wrongly by a power of ten — which is what `assertRegistryDecimals` refuses at runtime. Only the
+ * `TOKEN:` urn carries a number, because for a token there IS no authority in this estate: 29 §4.4
+ * asks for an operator to verify it against the contract, and USDT-on-Ethereum is 6.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export interface StakeAssetDeclaration {
+  readonly assetCode: StakeAssetCode
+  readonly decimals: number
+  readonly displayName: string
+  readonly enabled: boolean
+  readonly blockedReason: string | null
+}
+
+/** An enabled chain asset. Decimals from the package; a reason is forbidden on an enabled row. */
+function stakeable(assetCode: IssuableAssetCode, displayName: string): StakeAssetDeclaration {
+  return Object.freeze({
+    assetCode,
+    decimals: chainSpec(assetCode).decimals,
+    displayName,
+    enabled: true,
+    blockedReason: null,
+  })
+}
+
+/**
+ * Everything the platform can name at the stake door, enabled or not, in the seed's own order.
+ *
+ * The display names and the refusal are the migrations' own words, because they are what is SERVED
+ * to a user and they were written by the people who knew what was missing. Litecoin's seeded reason
+ * is deliberately not reproduced: migration 10 removed it when the blocker went, and the constraint
+ * forced it to NULL in the same statement.
+ */
+export const STAKE_ASSET_REGISTRY: readonly StakeAssetDeclaration[] = Object.freeze([
+  stakeable('EMBER', 'EMBER'),
+  stakeable('BTC', 'Bitcoin'),
+  stakeable('ETH', 'Ethereum'),
+  stakeable('LTC', 'Litecoin'),
+  Object.freeze({
+    assetCode: 'TOKEN:eth:mainnet:0xdac17f958d2ee523a2206206994597c13d831ec7' as TokenStakeAssetCode,
+    decimals: 6,
+    displayName: 'Tether USD (Ethereum)',
+    enabled: false,
+    // Byte-for-byte what migration 9 seeds, and `migrations.test.ts` compares it to the row rather
+    // than to a regexp: this string is SERVED to a user, and a reason that has drifted from the one
+    // the platform actually gives is a second answer to "why not?" with nobody's name on it.
+    blockedReason:
+      "micro-pricing quotes AssetCodes only and has no route for a TOKEN: urn. The peg is not " +
+      "assumed to be one dollar — an assumed peg is an administered rate with nobody's name " +
+      "on it.",
+  }),
+])
+
+/**
+ * The subset a stake will actually be taken in — what a sentence promising "you can stake in…" is
+ * allowed to count and to name.
+ */
+export const STAKEABLE_ASSETS: readonly StakeAssetDeclaration[] = Object.freeze(
+  STAKE_ASSET_REGISTRY.filter((asset) => asset.enabled),
+)
+
+/**
+ * The stakeable assets as a person reads them, in registry order.
+ *
+ * Display names and not codes: 29 §4.2's rule, and the reason a sentence wants them. Deliberately
+ * NOT joined into prose — whether a name takes an article ("the XRP Ledger") is an English fact
+ * that is not in the data, so the caller sets the list off rather than this guessing.
+ */
+export function stakeableAssetNames(): readonly string[] {
+  return STAKEABLE_ASSETS.map((asset) => asset.displayName)
+}
+
+/** Does this service ship prepared to take a stake in `code`? Nameable is not the same question. */
+export function isDeclaredStakeable(code: string): boolean {
+  return STAKEABLE_ASSETS.some((asset) => asset.assetCode === code)
+}
+
 /**
  * Is this asset a chain asset rather than a token? Tokens have no `ChainSpec` and therefore no
  * decimals of their own — `assetDecimals` in contracts-money refuses to guess and so does this.
