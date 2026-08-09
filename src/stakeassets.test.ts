@@ -13,14 +13,17 @@ import { CHAINS, RATE_SCALE, chainSpec, isRetiredAsset, type AssetCode } from '@
 import {
   POOL_ASSET,
   POOL_DECIMALS,
+  STAKE_ASSET_REGISTRY,
   StakeAssetError,
   disclosureFor,
   formatUnits,
+  isDeclaredStakeable,
   isTokenStakeAsset,
   parseStakeAssetCode,
   poolAmountFor,
   stakeAmountForPool,
   stakeAssetDecimals,
+  stakeableAssetNames,
   type StakeAsset,
 } from './stakeassets.ts'
 
@@ -322,4 +325,97 @@ test('staking EMBER is not described as a conversion, because it is not one', ()
     { assetCode: 'EMBER', decimals: 18, displayName: 'EMBER', enabled: true, blockedReason: null },
   )
   assert.doesNotMatch(text, /converts/)
+})
+
+/* ---------------------------------------- the declared registry (micro-org#291) */
+
+/**
+ * These are the cheap half. The expensive half is `migrations.test.ts`'s "the declared stake
+ * registry IS the one the migrations seed", which compares this array to the table the real
+ * migrations produce. What is checked HERE is that the declaration could not be a lie the schema
+ * would have caught: migration 9 puts two check constraints on `stake_assets` precisely so that a
+ * refusal always has a stated cause, and a file the schema would reject is a file nobody can trust
+ * to be describing the schema.
+ */
+test('the declaration obeys the two constraints the table is built with', () => {
+  // MUTATION: give an enabled row a `blockedReason`, or drop a disabled row's — either reddens
+  // here, and the same row would raise 23514 in `stake_assets_enabled_has_no_reason` /
+  // `stake_assets_disabled_has_reason` if it reached the database.
+  for (const asset of STAKE_ASSET_REGISTRY) {
+    if (asset.enabled) {
+      assert.equal(asset.blockedReason, null, `${asset.assetCode} is on and carrying an excuse`)
+    } else {
+      assert.ok(
+        (asset.blockedReason ?? '').length > 0,
+        `${asset.assetCode} is off with no reason: a user is owed "not yet, and here is what is missing"`,
+      )
+    }
+  }
+})
+
+test('every declared asset is one this service would accept at the door', () => {
+  // `parseStakeAssetCode` is what an arriving code is narrowed by, and it refuses SHARD by name as
+  // well as by type. A declared asset it would refuse is a promise the front door contradicts.
+  for (const asset of STAKE_ASSET_REGISTRY) {
+    assert.equal(parseStakeAssetCode(asset.assetCode), asset.assetCode)
+    assert.equal(isRetiredAsset(asset.assetCode as AssetCode), false)
+  }
+  const codes = STAKE_ASSET_REGISTRY.map((a) => a.assetCode)
+  assert.equal(new Set(codes).size, codes.length, 'an asset is declared twice')
+})
+
+test('declared decimals come from the pinned package, never from this file', () => {
+  // A registry that disagrees with contracts-chain sizes every stake in that asset wrongly by a
+  // power of ten, which is what `assertRegistryDecimals` refuses at runtime. MUTATION: type BTC as
+  // 18 → this reddens.
+  for (const asset of STAKE_ASSET_REGISTRY) {
+    if (isTokenStakeAsset(asset.assetCode)) continue
+    assert.equal(asset.decimals, chainSpec(asset.assetCode as AssetCode).decimals, asset.assetCode)
+  }
+})
+
+test('the pool asset is itself stakeable, or the pool could not be paid into', () => {
+  assert.ok(isDeclaredStakeable(POOL_ASSET))
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * BEING NAMEABLE IS NOT BEING STAKEABLE, AND THIS IS THE DRIFT micro-org#291 RECORDS, PINNED.
+ *
+ * micro-site derived "the 8 chains the platform supports" from `ON_CHAIN_ASSETS`. Four of those
+ * eight are not rows in `stake_assets` at all, so a bettor arriving with one is answered
+ * `404 unknown_asset` by a page that named their coin. This asserts the gap in the direction that
+ * matters: an asset this estate can NAME is not thereby an asset this service will TAKE.
+ *
+ * It is written against the chain table rather than against a typed list of the four, so it keeps
+ * meaning what it says as `ON_CHAIN_ASSETS` grows. It goes red the day every chain the estate
+ * models is also stakeable — at which point the declaration has been edited anyway, and the person
+ * editing it is the right person to be told that the two registers have converged.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a chain the estate can name is not thereby a chain a stake can be taken in', () => {
+  const nameable = (Object.keys(CHAINS) as AssetCode[]).filter((code) => !isRetiredAsset(code))
+  const unstakeable = nameable.filter((code) => !isDeclaredStakeable(code))
+  assert.ok(
+    unstakeable.length > 0,
+    'every nameable chain is now stakeable — check any copy that distinguishes the two registers',
+  )
+  // Each of them is nameable enough to reach the front door and be refused there, which is the
+  // failure a promise counted from the wrong register produces.
+  for (const code of unstakeable) {
+    assert.equal(parseStakeAssetCode(code), code)
+  }
+})
+
+test('the names a sentence may print are the enabled ones, in registry order', () => {
+  // What micro-site's copy needs: a list it can count and set off, with no article guessed for it.
+  assert.deepEqual(
+    stakeableAssetNames(),
+    STAKE_ASSET_REGISTRY.filter((a) => a.enabled).map((a) => a.displayName),
+  )
+  assert.equal(
+    stakeableAssetNames().some((name) => name.startsWith('TOKEN:')),
+    false,
+    'a code reached a sentence; 29 §4.2 — a display grouping is never a code',
+  )
 })
