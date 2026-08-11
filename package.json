@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/foresight",
-  "version": "2.5.19",
+  "version": "2.5.20",
   "private": true,
   "description": "Forge Foresight: a parimutuel prediction market native to Hearth. The stake and the payout are the contract's; this service orchestrates the lifecycle, proposes questions for a person to approve, and mirrors the chain.",
   "license": "MIT",
@@ -47,6 +47,7 @@
     "@cloudsforge/auth": "link:../runtime/packages/auth",
     "@cloudsforge/contracts-auth": "link:../contracts/packages/auth",
     "@cloudsforge/contracts-chain": "link:../contracts/packages/chain",
+    "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/db": "link:../runtime/packages/db",
     "@cloudsforge/http": "link:../runtime/packages/http",
     "@cloudsforge/jobs": "link:../runtime/packages/jobs",

@@ -9,7 +9,17 @@
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type postgres from 'postgres'
-import { MARKET_OPENED, TOPICS, signEvent, verifyEventSignature, withInbox, withOutbox } from './outbox.ts'
+import { classifyEnvelope, type EventVersion } from '@cloudsforge/contracts-events'
+import {
+  MARKET_OPENED,
+  TOPICS,
+  buildEnvelope,
+  signEvent,
+  verifyEventSignature,
+  withInbox,
+  withOutbox,
+  type OutboxRow,
+} from './outbox.ts'
 import { db, enabled, migrateTestDb, openDb, resetForesight, seedDraft, skip } from './testsupport.ts'
 
 let sql: postgres.Sql
@@ -132,4 +142,100 @@ test('a handler that fails leaves no inbox row, so the redelivery is processed',
   })
   assert.equal(outcome.status, 'processed')
   assert.equal(runs, 1)
+})
+
+/* ------------------------------------------------------------------ what goes on the wire */
+
+/**
+ * A real stored row, read from the mainnet estate on 2026-08-11 — micro-org#366.
+ *
+ * `foresight.market.closed` is written by the close sweep, which has no request behind it and so
+ * writes a NULL correlation id. That null is why this row is the fixture rather than a market
+ * opened by an operator: it is the reason a version-only patch does not reach this service.
+ */
+const STORED_ROW: OutboxRow = {
+  id: '729f1833-5898-464e-b9da-f4bb42719b97',
+  topic: 'foresight.market.closed',
+  key: 'f99f8280-02de-434c-8aa8-040d81234cb7',
+  occurred_at: new Date('2026-08-06T00:00:56.794Z'),
+  producer: 'foresight',
+  version: 1,
+  actor: 'service:foresight',
+  correlation_id: null,
+  payload: { id: 'f99f8280-02de-434c-8aa8-040d81234cb7', status: 'closed', network: 'mainnet' },
+}
+
+/**
+ * **THE SIGNATURE WAS RIGHT AND THE ENVELOPE WAS NOT.**
+ *
+ * `@cloudsforge/contracts-events` types the wire version as "major.minor" — a STRING — and this
+ * relay stamped the stored INTEGER. A delivery that verified was still discarded at the envelope
+ * before any consumer read a payload. Eight relays did this at once and every suite in the estate
+ * stayed green, because each one declared its OWN `EventEnvelope` and no compiler ever compared
+ * the two.
+ *
+ * Measured with the contract's own `classifyEnvelope` against `STORED_ROW` on 2026-08-11:
+ *
+ *      as shipped -> malformed: version: missing, correlationId: missing
+ *     fixed      -> well-formed; only the registration is outstanding
+ *
+ * The verdict is taken from the CONTRACT'S OWN classifier, never from a shape restated here. A
+ * local copy of the rule agrees with a wrong implementation instead of catching it, which is the
+ * mistake that produced the defect in the first place.
+ *
+ * MUTATIONS THIS KILLS — each one applied to `buildEnvelope` and each one confirmed red:
+ *   - `version: row.version`, the stored integer, which is what shipped: `classifyEnvelope`
+ *     answers `version: missing` and the defect assertion fails.
+ *   - `version: String(row.version)` — a string, but "1" rather than "1.0": the shape assertion
+ *     fails, so widening the fix to "any string" does not survive either.
+ *   - `actor: row.actor` / `correlationId: row.correlation_id`, the nullable columns passed
+ *     straight through, which is the other half of what the estate measured above.
+ */
+test('the envelope this relay puts on the wire is one the contract accepts', () => {
+  const envelope = buildEnvelope(STORED_ROW)
+
+  assert.equal(typeof envelope.version, 'string', 'an integer version is refused as "version: missing"')
+  assert.match(envelope.version, /^\d+\.\d+$/, 'the contract types the wire version as "major.minor"')
+  assert.equal(envelope.version, '1.0', 'major 1 as stored, minor 0 — storage records the major')
+  // The nullable columns never reach the wire. `system` is the contract's own value for "no
+  // principal did this"; the correlation id falls back to the event id so it is never absent.
+  // This row has correlationId null in storage, which is two of the defects measured above.
+  assert.equal(envelope.actor, 'service:foresight')
+  assert.equal(envelope.correlationId, STORED_ROW.id)
+
+  // ── AND FROM A ROW WITH THE NULLABLE COLUMNS EMPTY. The row above already has a null correlation id; a null ACTOR is the sweep one emit site
+  // away, and `withOutbox` writes one whenever a caller omits it.
+  const fromNulls = buildEnvelope({ ...STORED_ROW, actor: null, correlation_id: null })
+  assert.equal(fromNulls.actor, 'system', 'the contract has no null actor; `system` is its word for one')
+  assert.equal(fromNulls.correlationId, STORED_ROW.id, 'never absent — an absent one ends an investigation')
+  assert.deepEqual(
+    classifyEnvelope(fromNulls).defects,
+    [],
+    'a null column must not become a defect on the wire',
+  )
+
+  // The topic is not in the contract's registry yet, so the honest verdict is `unregistered_topic`
+  // and NOT `valid` — a different fact with a different remedy. What matters here is `defects`:
+  // once the registration lands, an EMPTY defect list is the difference between this event being
+  // read and being discarded, and `version: missing` is what used to be in it.
+  const verdict = classifyEnvelope(envelope)
+  assert.equal(verdict.reason, 'unregistered_topic', `got: ${JSON.stringify(verdict)}`)
+  assert.deepEqual(verdict.defects, [], 'well-formed: the ONLY thing outstanding is the registration')
+})
+
+/**
+ * The teeth of the test above. Without this, every assertion there would still pass against a
+ * classifier that accepted anything at all, and "the contract accepts it" would be a claim about
+ * this file rather than about the estate.
+ */
+test('the shape this relay used to send is REFUSED by the same classifier', () => {
+  const asShipped = { ...buildEnvelope(STORED_ROW), version: STORED_ROW.version as unknown as EventVersion }
+
+  const verdict = classifyEnvelope(asShipped)
+  assert.equal(verdict.ok, false, 'an integer version must be refused at the envelope')
+  assert.equal(verdict.reason, 'malformed', 'refused as malformed, not merely shelved as unregistered')
+  assert.ok(
+    verdict.defects.some((d) => d.startsWith('version')),
+    `refused FOR THE VERSION, not incidentally: ${JSON.stringify(verdict)}`,
+  )
 })
