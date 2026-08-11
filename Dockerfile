@@ -53,6 +53,12 @@ RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store,sharing=locked \
 FROM deps AS build
 COPY tsconfig.json tsconfig.base.json ./
 COPY src ./src
+# `seed/` is here for the TYPECHECK and not for the image. `src/seedquestions.test.ts` imports
+# `seed/questions-2026h2.mjs` to validate it against the allowlist, so without this line `tsc`
+# stops at TS2307 and the image build fails on a file the running service never reads — the seed
+# questions are input to the estate's bootstrap seeder, not to this process. It is deliberately not
+# copied into the runtime stage below, for the same reason.
+COPY seed ./seed
 RUN pnpm typecheck
 
 # ----------------------------------------------------------------------------------- runtime
