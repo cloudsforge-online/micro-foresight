@@ -86,7 +86,13 @@ import { CATEGORY_VERSION } from './categories.ts'
 import { chainKey, type ChainId } from './chains.ts'
 import { driveDeploy, listOutstandingDeploys, type DeployDeps } from './deploy.ts'
 import { insertIdea, IdeaError } from './ideas.ts'
-import { feeIdempotencyKey, feePostings, LedgerUnavailableError, type LedgerClient } from './ledgerclient.ts'
+import {
+  feeIdempotencyKey,
+  feePostings,
+  FEE_ENTRY_KIND,
+  LedgerUnavailableError,
+  type LedgerClient,
+} from './ledgerclient.ts'
 import { closeMarket, listDueToClose, markResolved, markSettled, voidMarket } from './markets.ts'
 import { listMirrorable, recordSyncError, syncMarket, type MirrorDeps } from './mirror.ts'
 import { withOutbox, type Db } from './outbox.ts'
@@ -417,7 +423,7 @@ export function feeReportHandler(deps: JobDeps): Handler {
           // ledger/src/migrations.ts). The original 'foresight.settlement_fee' was not in the
           // list and every report died at the constraint — see feePostings' header in
           // ledgerclient.ts for the full finding.
-          kind: 'fee_charged',
+          kind: FEE_ENTRY_KIND,
           actor: `service:${deps.producer}`,
           correlationId: row.market_id,
           idempotencyKey: feeIdempotencyKey(row.market_id),
