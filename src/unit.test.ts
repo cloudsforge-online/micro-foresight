@@ -34,6 +34,29 @@ import { requestFingerprint, namespacedKey } from './idempotency.ts'
 import { PROMPT_TEMPLATE, renderPrompt, toProposal, UNCONFIGURED_PROPOSER } from './proposer.ts'
 import { decodeFeePaid, decodeStaked, FEE_PAID_TOPIC, STAKED_TOPIC } from './mirror.ts'
 import { chainIdOf, requiredConfirmations } from './chains.ts'
+import { ENTRY_KINDS, isEntryKind } from '@cloudsforge/contracts-money'
+import { FEE_ENTRY_KIND } from './ledgerclient.ts'
+
+/* ------------------------------------------------------------------ the entry kind */
+
+test('the fee kind is one the LEDGER will actually accept', () => {
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // micro-org#424, and THIS service is why the ticket exists. `foresight.settlement_fee` was
+  // posted from `jobs.ts` for months. It is not in the ledger's closed vocabulary, so
+  // `validateEntryRequest` answered 400 before opening a transaction and not one settlement fee
+  // was ever recorded — a defect whose only symptom is nothing happening. Tessera then made the
+  // identical mistake with `item_issue` (micro-org#407 §3).
+  //
+  // Two things stop the third one. `EntryRequest.kind` is `EntryKind`, so a call site cannot
+  // compile an invented kind; and this, which checks MEMBERSHIP rather than spelling. Spelling is
+  // what the old `jobs.test.ts` assertion checked, and it agreed with the broken code.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  assert.ok(isEntryKind(FEE_ENTRY_KIND), `${FEE_ENTRY_KIND} is not in the ledger's closed set`)
+  assert.ok(ENTRY_KINDS.includes(FEE_ENTRY_KIND))
+  // The value itself is pinned too: the ledger's revenue reporting counts `fee_charged`, so
+  // swapping it for another member of the set would still post and would still be wrong.
+  assert.equal(FEE_ENTRY_KIND, 'fee_charged')
+})
 
 /* ------------------------------------------------------------------ the allowlist */
 

@@ -19,6 +19,7 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
+import type { EntryKind } from '@cloudsforge/contracts-money'
 
 /**
  * The scopes this service's token must carry to call this peer.
@@ -62,8 +63,29 @@ export interface Posting {
   }
 }
 
+/**
+ * The one kind this service posts.
+ *
+ * A named constant rather than a literal at the call site so that the membership assertion in
+ * `unit.test.ts` and the posting in `jobs.ts` are the SAME value. A test that re-spells the literal
+ * it is checking asserts nothing — that is precisely how `foresight.settlement_fee` survived: the
+ * test agreed with the code, and both were wrong about the ledger.
+ */
+export const FEE_ENTRY_KIND: EntryKind = 'fee_charged'
+
 export interface EntryRequest {
-  readonly kind: string
+  /**
+   * One of the ledger's closed vocabulary, and typed as such — micro-org#424.
+   *
+   * This was `string`, and THIS SERVICE is the reason the ticket exists. `foresight.settlement_fee`
+   * was posted here for months; it is not a kind, so `validateEntryRequest` answered 400 before it
+   * opened a transaction and not one fee was ever recorded. micro-tessera then made the identical
+   * mistake with `item_issue` (micro-org#407 §3) and no object ever entered the ledger either.
+   *
+   * A `string` here cannot catch either one. `EntryKind` catches both at compile time, which is the
+   * only place a defect whose symptom is *nothing happening* can be caught cheaply.
+   */
+  readonly kind: EntryKind
   readonly actor: string
   readonly correlationId: string
   readonly idempotencyKey: string
