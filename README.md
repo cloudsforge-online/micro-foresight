@@ -139,6 +139,31 @@ service that fell over without its suggester would have the dependency exactly b
 
 ---
 
+## `seed/` — questions written by hand, checked by the build
+
+There is no market seed *migration* and there is not going to be one. A market is created through
+`POST /markets` by an admin user and approved by a named operator, and a migration that inserted
+rows into `markets` would be the fourth write path the three guards above exist to prevent.
+
+What `seed/` holds is the **data**, not the mechanism: `questions-2026h2.mjs` is a dependency-free
+ESM module exporting an array in the exact shape `POST /markets` takes, plus `cover` (the style
+prompt for generated art) and `observed` (the reading that justified the threshold). It is plain
+`.mjs` rather than TypeScript because the estate's seeder is a bare-`node` script with no loader;
+`questions-2026h2.d.mts` is what lets this repository's own tests import it under `tsc`.
+
+The reason the data lives *here*, next to the rules, is `src/seedquestions.test.ts`. It runs the
+service's own predicates — `isCategory`, `isSourceKindFor`, the numeric bounds `server.ts` enforces,
+`questionHash` itself — over every entry, on every push, with no database and no chain. Without it,
+a category paired with a source kind it is not allowed is discovered as a 400 by an operator
+mid-bootstrap, with some markets created and some not. It does **not** check whether a question is
+one the platform should run: that is the allowlist and a person, for the reason two sections up.
+
+The suite also carries a deliberate tripwire. `createDraft` refuses a close time in the past, so an
+expired batch is a file that fails per-entry the moment anyone uses it; the build goes red when the
+*last* question in a batch closes, and the message says to research a new batch or delete the file.
+
+---
+
 ## Resolution honesty
 
 The resolution source is **named at open** and hashed into the contract at open. `questiondoc.ts`
