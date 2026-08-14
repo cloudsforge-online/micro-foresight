@@ -27,12 +27,16 @@ import type { Principal, Verifier } from '@cloudsforge/auth'
 import { createServer, type ServerDeps } from './server.ts'
 import {
   aggregateShares,
+  custodialPoolOf,
   custodialPositionOf,
   escrowPostings,
   refundPostings,
   settlementPostings,
+  splitPayouts,
+  unresolvedStakes,
   type CustodialStake,
 } from './custodialstakes.ts'
+import { custodialSettleHandler, type JobDeps } from './jobs.ts'
 import {
   BTC_USD_SCALED,
   CUSTODIAL,
@@ -819,4 +823,252 @@ test('the aggregate counts only what reached the chain', { skip }, async () => {
   // and they are owed the position, whether or not the broadcast has landed.
   const position = await custodialPositionOf(db(sql), marketId, SUBJECT)
   assert.equal(position.yes, BigInt(TWO_THOUSAND_FOUR_HUNDRED_EMBER) * 2n)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+   THE EXIT
+
+   Everything above proves money can get INTO escrow correctly. These prove it can get out, which
+   until this change it could not: `markSettled` takes only a `staked` row, `staked` needs a
+   transaction hash, and custody refuses to sign the call that would produce one. A user who staked
+   was short the money with no path back.
+   ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** A stake row, as `splitPayouts` reads one. Only the three fields it touches are real. */
+function fakeStake(id: string, outcome: number, poolAmount: bigint): CustodialStake {
+  return { id, outcome, poolAmount } as unknown as CustodialStake
+}
+
+test('the split pays winners their stake back plus the losers’ money, pro rata', () => {
+  // 100 and 300 on YES, 400 on NO. YES wins, so the 400 is divided 1:3.
+  const payouts = splitPayouts(
+    [fakeStake('a', 0, 100n), fakeStake('b', 0, 300n), fakeStake('c', 1, 400n)],
+    0,
+  )
+  assert.deepEqual(
+    payouts.map((p) => [p.stakeId, p.payout.toString()]),
+    [
+      ['a', '200'], // 100 back + 100 of the 400
+      ['b', '600'], // 300 back + 300 of the 400
+    ],
+  )
+  // MUTATION: drop `stake.poolAmount +` from the share → winners get only their winnings and lose
+  // their own stake, which is a parimutuel that eats the pool.
+  assert.equal(
+    payouts.reduce((sum, p) => sum + p.payout, 0n),
+    800n,
+    'a parimutuel pays out exactly what was staked into it, never more and never less',
+  )
+})
+
+test('nobody on the winning side means no payouts at all — the caller refunds instead', () => {
+  // Not "pay everyone zero". An empty list is how this function says the division is undefined,
+  // and `custodialSettleHandler` turns that into a refund in the asset each stake arrived in.
+  assert.deepEqual(splitPayouts([fakeStake('a', 1, 100n), fakeStake('b', 1, 50n)], 0), [])
+  assert.deepEqual(splitPayouts([], 0), [])
+})
+
+test('nobody on the losing side means every winner takes back exactly what they staked', () => {
+  const payouts = splitPayouts([fakeStake('a', 0, 100n), fakeStake('b', 0, 50n)], 0)
+  assert.deepEqual(
+    payouts.map((p) => p.payout.toString()),
+    ['100', '50'],
+  )
+})
+
+test('THE DUST IS PAID OUT, deterministically, and never kept', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // 1 + 1 + 1 winning against 2. Each share is 2*1/3 = 0 after flooring, so the floors leave the
+  // WHOLE 2 undistributed. A split that stopped at the floor would quietly bank it.
+  //
+  // The remainder goes out one unit at a time, largest stake first, ties by id — so with three
+  // equal stakes it is 'a' then 'b'. MUTATION: delete the remainder loop → this reddens with 3
+  // paid against 5 staked, and the missing 2 is in nobody's account.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  const stakes = [fakeStake('a', 0, 1n), fakeStake('b', 0, 1n), fakeStake('c', 0, 1n), fakeStake('d', 1, 2n)]
+  const payouts = splitPayouts(stakes, 0)
+  assert.deepEqual(
+    payouts.map((p) => [p.stakeId, p.payout.toString()]),
+    [['a', '2'], ['b', '2'], ['c', '1']],
+  )
+  assert.equal(payouts.reduce((sum, p) => sum + p.payout, 0n), 5n)
+})
+
+test('the split does not depend on the order the rows were read in', () => {
+  // Two callers reading the same market with different `order by` must pay the same people the
+  // same amounts, or the answer depends on the query plan.
+  const stakes = [fakeStake('a', 0, 5n), fakeStake('b', 0, 3n), fakeStake('c', 0, 1n), fakeStake('d', 1, 4n)]
+  const forward = splitPayouts(stakes, 0)
+  const backward = splitPayouts([...stakes].reverse(), 0)
+  const asMap = (rows: readonly { stakeId: string; payout: bigint }[]) =>
+    Object.fromEntries(rows.map((r) => [r.stakeId, r.payout.toString()]))
+  assert.deepEqual(asMap(forward), asMap(backward))
+})
+
+/* ------------------------------------------------------------------ the job, end to end */
+
+/** Only the fields `custodialSettleHandler` reads are real; the rest would be a world to build. */
+function settleDeps(): JobDeps {
+  return {
+    sql: db(sql),
+    producer: 'foresight',
+    logger: quietLogger(),
+    metrics: testMetrics(),
+    ledger,
+    now: () => new Date(),
+  } as unknown as JobDeps
+}
+
+const RUN = { heartbeat: async () => {} } as unknown as Parameters<ReturnType<typeof custodialSettleHandler>>[1]
+
+async function stake(marketId: string, outcome: number, key: string, amount = ONE_HUNDREDTH_BTC) {
+  const response = await call('POST', `/markets/${marketId}/stakes`, {
+    token: 'player',
+    key,
+    body: { asset: 'BTC', amount, outcome },
+  })
+  assert.equal(response.status, 201, JSON.stringify(response.body))
+}
+
+test('a resolved market pays the custodial pool out, and escrow is empty afterwards', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'settle-0001')
+  await stake(marketId, 1, 'settle-0002')
+  await sql`update markets set status = 'resolved', outcome = 0, resolved_at = now() where id = ${marketId}`
+
+  ledger.reset()
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+
+  const rows = await sql<{ outcome: number; state: string }[]>`
+    select outcome, state from custodial_stakes where market_id = ${marketId} order by outcome
+  `
+  // Both rows terminate. The LOSER'S row matters as much as the winner's: its escrowed EMBER has
+  // to leave, or the pool it was paid out of never balances and the loser is short for ever.
+  assert.deepEqual(rows.map((r) => r.state), ['paid', 'paid'])
+
+  // Two entries, both `market_settled` — a kind from the ledger's closed vocabulary. MUTATION:
+  // invent `market_settlement` → the real ledger 400s and every payout stops, which is the defect
+  // that silently killed `item_issue` for a month.
+  assert.equal(ledger.entries.length, 2)
+  for (const entry of ledger.entries) assert.equal(entry.kind, 'market_settled')
+
+  // The winner was paid both stakes' worth; the loser was paid nothing but still spent escrow.
+  const net = new Map<string, bigint>()
+  for (const entry of ledger.entries) {
+    for (const posting of entry.postings) {
+      const signed = posting.direction === 'credit' ? posting.amount : -posting.amount
+      const account = posting.account as unknown as { purpose?: string }
+      const name = account.purpose ?? 'clearing'
+      net.set(name, (net.get(name) ?? 0n) + signed)
+    }
+  }
+  const staked = 2n * BigInt(TWO_THOUSAND_FOUR_HUNDRED_EMBER)
+  assert.equal(net.get('escrow'), -staked, 'every last unit of escrow must be spent')
+  assert.equal(net.get('available'), staked, 'and every last unit of it paid out')
+
+  assert.deepEqual(await unresolvedStakes(db(sql), marketId), [])
+})
+
+test('a void market refunds every custodial stake in the asset it arrived in', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'void-0001')
+  await sql`update markets set status = 'void', void_reason = 'the source went dark', voided_at = now()
+             where id = ${marketId}`
+
+  ledger.reset()
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+
+  const rows = await sql<{ state: string; tx_hash: string | null }[]>`
+    select state, tx_hash from custodial_stakes where market_id = ${marketId}
+  `
+  assert.equal(rows[0]?.state, 'refunded')
+  assert.equal(rows[0]?.tx_hash, null)
+  // BTC BACK, NOT EMBER. The user brought bitcoin and a void is not a moment to hand them an
+  // EMBER position they never asked for — `refundPostings` reverses both legs of the conversion.
+  const entry = ledger.entries[0]!
+  assert.ok(entry.postings.some((p) => p.assetCode === 'BTC' && p.direction === 'credit'))
+})
+
+test('a resolution nobody won refunds rather than paying zero to everybody', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'nowin-0001')
+  await sql`update markets set status = 'resolved', outcome = 1, resolved_at = now() where id = ${marketId}`
+
+  ledger.reset()
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+
+  // The only staker backed YES and NO won — but there was nobody on NO to divide their money
+  // between. Paying zero would keep it; the platform is not a counterparty here and never wins.
+  const rows = await sql<{ state: string }[]>`select state from custodial_stakes where market_id = ${marketId}`
+  assert.equal(rows[0]?.state, 'refunded')
+  assert.ok(ledger.entries[0]!.postings.some((p) => p.assetCode === 'BTC' && p.direction === 'credit'))
+})
+
+test('THE CONSTRAINT: a second pass pays nobody twice', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'twice-0001')
+  await stake(marketId, 1, 'twice-0002')
+  await sql`update markets set status = 'resolved', outcome = 0, resolved_at = now() where id = ${marketId}`
+
+  ledger.reset()
+  const handler = custodialSettleHandler(settleDeps())
+  await handler({ key: 'global', payload: {} } as never, RUN)
+  const afterFirst = ledger.entries.length
+  await handler({ key: 'global', payload: {} } as never, RUN)
+
+  // The second pass finds nothing: `marketsAwaitingCustodialSettlement` reads `accepted` only, and
+  // both rows are `paid`. MUTATION: widen that query to every state → this reddens with four
+  // entries, and the winner has been paid the pool twice out of money that does not exist.
+  assert.equal(ledger.entries.length, afterFirst)
+})
+
+test('an unfinished market is left alone, however much is escrowed against it', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'open-0001')
+
+  ledger.reset()
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+  assert.equal(ledger.entries.length, 0)
+  const rows = await sql<{ state: string }[]>`select state from custodial_stakes where market_id = ${marketId}`
+  assert.equal(rows[0]?.state, 'accepted')
+})
+
+test('a ledger that is down defers the whole market rather than half-settling it', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'down-0001')
+  await stake(marketId, 1, 'down-0002')
+  await sql`update markets set status = 'resolved', outcome = 0, resolved_at = now() where id = ${marketId}`
+
+  ledger.reset()
+  ledger.setDown(true)
+  // It does NOT throw. Throwing would spend this job's attempt budget on an outage and dead-letter
+  // the only thing that can release escrow — see the handler's header.
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+  const stuck = await sql<{ state: string }[]>`select state from custodial_stakes where market_id = ${marketId}`
+  assert.deepEqual(stuck.map((r) => r.state), ['accepted', 'accepted'])
+
+  ledger.setDown(false)
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+  const done = await sql<{ state: string }[]>`select state from custodial_stakes where market_id = ${marketId}`
+  assert.deepEqual(done.map((r) => r.state), ['paid', 'paid'])
+})
+
+test('the platform pool is reported separately from the contract’s, and counts paid stakes', { skip }, async () => {
+  const marketId = await openMarket()
+  await stake(marketId, 0, 'pool-0001')
+  await stake(marketId, 1, 'pool-0002')
+
+  const before = await custodialPoolOf(db(sql), marketId)
+  assert.equal(before.yes.toString(), TWO_THOUSAND_FOUR_HUNDRED_EMBER)
+  assert.equal(before.no.toString(), TWO_THOUSAND_FOUR_HUNDRED_EMBER)
+  assert.equal(before.stakers, 1)
+
+  await sql`update markets set status = 'resolved', outcome = 0, resolved_at = now() where id = ${marketId}`
+  await custodialSettleHandler(settleDeps())({ key: 'global', payload: {} } as never, RUN)
+
+  // Still readable after settlement. `paid` counts and `refunded` does not: one is money that took
+  // a side, the other is money that was handed back — and the odds a page quotes are about the first.
+  const after = await custodialPoolOf(db(sql), marketId)
+  assert.equal(after.yes.toString(), TWO_THOUSAND_FOUR_HUNDRED_EMBER)
+  assert.equal(after.no.toString(), TWO_THOUSAND_FOUR_HUNDRED_EMBER)
 })

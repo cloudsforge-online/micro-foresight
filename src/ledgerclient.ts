@@ -100,8 +100,37 @@ export interface PostedEntry {
   readonly replayed: boolean
 }
 
+/** One account's balance, as `GET /accounts/:subject/balances` reports it. */
+export interface LedgerBalance {
+  readonly assetCode: string
+  /** `available`, `escrow`, `reserved`… The purpose is what makes the number mean something. */
+  readonly purpose: string
+  /** Smallest units, as a decimal STRING. Never a number — one EMBER is 1e18 wei. */
+  readonly amount: string
+  readonly status: string
+}
+
 export interface LedgerClient {
   postEntry(request: EntryRequest): Promise<PostedEntry>
+  /**
+   * What one subject holds.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════
+   * **READ-ONLY, AND IT IS NEVER THE THING THAT REFUSES A STAKE.**
+   *
+   * This exists so the staking panel can show a user what they have to stake with, which is the
+   * difference between a form that works and a form you fill in twice. It must not become a
+   * balance CHECK. The ledger's overdraft trigger, on the account that actually holds the number,
+   * is what refuses a stake larger than the balance — a check here would be a second opinion read
+   * a moment earlier, and the window between the two is the overdraft. The stake route says so
+   * already and this method does not change it.
+   *
+   * A failure is a `LedgerUnavailableError` like any other, and the panel renders WITHOUT the
+   * figure rather than refusing to render: not knowing what somebody holds is not a reason to
+   * stop them staking.
+   * ══════════════════════════════════════════════════════════════════════════════════════════
+   */
+  balances(subject: string): Promise<readonly LedgerBalance[]>
 }
 
 /**
@@ -179,6 +208,13 @@ interface RawEntry {
   readonly recordedAt: string
 }
 
+interface RawBalance {
+  readonly assetCode: string
+  readonly purpose: string
+  readonly amount: string
+  readonly status: string
+}
+
 export function httpLedgerClient(options: LedgerClientOptions): LedgerClient {
   const client = new HttpClient({
     baseUrl: options.baseUrl,
@@ -222,6 +258,25 @@ export function httpLedgerClient(options: LedgerClientOptions): LedgerClient {
           recordedAt: body.entry.recordedAt,
           replayed: body.replayed,
         }
+      } catch (err) {
+        throw translate(err)
+      }
+    },
+
+    async balances(subject) {
+      try {
+        // Encoded, because a subject is `user:<uuid>` and the ledger decodes the path segment —
+        // its own route comment says a well-behaved client percent-encodes the colon.
+        const body = await client.request<{ balances: readonly RawBalance[] }>(
+          `/accounts/${encodeURIComponent(subject)}/balances`,
+          { method: 'GET' },
+        )
+        return body.balances.map((row) => ({
+          assetCode: row.assetCode,
+          purpose: row.purpose,
+          amount: row.amount,
+          status: row.status,
+        }))
       } catch (err) {
         throw translate(err)
       }

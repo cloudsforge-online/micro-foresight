@@ -83,6 +83,17 @@ import { JobQueue, type Handler, type RunnerEvent } from '@cloudsforge/jobs'
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { CATEGORY_VERSION } from './categories.ts'
+import {
+  markPaid,
+  markRefunded,
+  marketsAwaitingCustodialSettlement,
+  poolPayoutPostings,
+  refundPostings,
+  splitPayouts,
+  stakeIdempotencyKey,
+  unresolvedStakes,
+  type CustodialStake,
+} from './custodialstakes.ts'
 import { chainKey, type ChainId } from './chains.ts'
 import { driveDeploy, listOutstandingDeploys, type DeployDeps } from './deploy.ts'
 import { insertIdea, IdeaError } from './ideas.ts'
@@ -114,6 +125,7 @@ export const FEE_REPORT = 'fee.report'
 export const OUTBOX_RELAY = 'outbox.relay'
 export const DEPLOY_SWEEP = 'deploy.sweep'
 export const MIRROR_SWEEP = 'mirror.sweep'
+export const CUSTODIAL_SETTLE = 'custodial.settle'
 
 export const JOB_KINDS: readonly string[] = Object.freeze([
   IDEA_PROPOSE,
@@ -125,6 +137,7 @@ export const JOB_KINDS: readonly string[] = Object.freeze([
   OUTBOX_RELAY,
   DEPLOY_SWEEP,
   MIRROR_SWEEP,
+  CUSTODIAL_SETTLE,
 ])
 
 const SECOND = 1_000
@@ -456,6 +469,150 @@ export function feeReportHandler(deps: JobDeps): Handler {
   }
 }
 
+/* ------------------------------------------------------------------ custodial settlement */
+
+/**
+ * Pay out — or give back — every custodial stake on a market that is over.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS IS THE EXIT. BEFORE IT EXISTED, MONEY COULD GET INTO ESCROW AND NEVER GET OUT.**
+ *
+ * The route above takes a custodial stake by posting `market_escrow`: the user's asset leaves their
+ * available balance and an EMBER position lands in their ESCROW balance. Escrow is not spendable.
+ * Something has to spend it, and until this handler there was nothing that could:
+ *
+ *   - `markSettled` accepts only a stake in state `'staked'`;
+ *   - `'staked'` requires a transaction hash (`custodial_stakes_staked_has_evidence`);
+ *   - the hash can only come from custody signing `stake(uint8)` on the market contract;
+ *   - custody will not. `SIGNABLE_PURPOSES` in `custody/src/gates.ts` binds every signable purpose
+ *     to a creation, a bare transfer or a sweep, and `stake(uint8)` is a value-bearing CALL with
+ *     calldata. `custodyclient.ts` in this service states the refusal and declines to overturn it.
+ *
+ * So the only reachable terminal state was `refunded`, and nothing scheduled that either. A user
+ * who staked was simply short the money, indefinitely, with a row in `accepted` recording it.
+ *
+ * ── WHAT IS PAID, AND OUT OF WHOSE MONEY ──────────────────────────────────────────────────────
+ *
+ * The custodial stakes on a market form **their own parimutuel pool**, held by the platform and
+ * settled here against the outcome the CHAIN resolved. It is self-funded by construction: the only
+ * money paid out is money that was staked into it, so the platform is never the counterparty and
+ * cannot owe what it does not hold. `splitPayouts` does the division and documents its three edges.
+ *
+ * It is **not** the contract's pool and is never added to it — `custodialPoolOf` says why at
+ * length. The odds a custodial staker faces are the custodial pool's odds.
+ *
+ * ── ORDER, AND WHAT A CRASH COSTS ─────────────────────────────────────────────────────────────
+ *
+ * Per stake: post the entry, then mark the row. A crash between them leaves an `accepted` row whose
+ * money HAS moved, and the next pass would pay it twice — except that the entry carries
+ * `stakeIdempotencyKey(id, 'payout' | 'refund')`, so the second post is a replay that returns the
+ * first entry's id and the row is marked from that. The key is derived from the stake id and
+ * nothing else, which is what makes the retry safe rather than merely likely to be.
+ *
+ * The reverse order — mark then post — would strand the opposite way: a row saying paid with no
+ * entry behind it, which is a user told they were paid money that never left escrow.
+ *
+ * A `LedgerUnavailableError` stops this market's pass and leaves the rest for the next run, exactly
+ * as the fee report does. It does NOT throw, because a ledger that is down for a minute must not
+ * spend this job's attempt budget and dead-letter the only thing that can release escrow.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function custodialSettleHandler(deps: JobDeps): Handler {
+  return async (_job, ctx) => {
+    const now = (deps.now ?? (() => new Date()))()
+    const due = await marketsAwaitingCustodialSettlement(deps.sql, 20)
+    for (const market of due) {
+      const stakes = await unresolvedStakes(deps.sql, market.marketId)
+      if (stakes.length === 0) continue
+
+      // A void, and a resolution nobody won, are the same act: give everybody back exactly what
+      // they brought, in the asset they brought it in. `splitPayouts` returns an empty list for the
+      // second case precisely so that it cannot be mistaken for "pay everyone zero".
+      const winners = market.status === 'void' ? [] : splitPayouts(stakes, market.outcome ?? -1)
+      const refundAll = winners.length === 0
+
+      try {
+        if (refundAll) {
+          for (const stake of stakes) await refundOne(deps, stake, market.marketId, now)
+          deps.metrics.increment('foresight_custodial_settlements_total', {
+            outcome: market.status === 'void' ? 'void_refund' : 'no_winner_refund',
+          })
+          continue
+        }
+        const payouts = new Map(winners.map((payout) => [payout.stakeId, payout.payout]))
+        for (const stake of stakes) await payOne(deps, stake, payouts.get(stake.id) ?? 0n, market.marketId, now)
+        deps.metrics.increment('foresight_custodial_settlements_total', { outcome: 'paid' })
+      } catch (err) {
+        if (err instanceof LedgerUnavailableError) {
+          deps.logger.warn('custodial settlement deferred: the ledger was unavailable', {
+            marketId: market.marketId,
+            err: err.message,
+          })
+          return
+        }
+        throw err
+      }
+      await ctx.heartbeat()
+    }
+  }
+}
+
+/** Give one stake back whole, in the asset it arrived in. The exact reversal of the escrow entry. */
+async function refundOne(deps: JobDeps, stake: CustodialStake, marketId: string, now: Date): Promise<void> {
+  const entry = await deps.ledger.postEntry({
+    // ────────────────────────────────────────────────────────────────────────────────────────
+    // `market_settled`, NOT `reversal`, and the temptation is real: `refundPostings` is literally
+    // `escrowPostings` with every direction flipped, which is what a reversal is.
+    //
+    // Two reasons it must not be. The ledger's `reversal` kind is defined by `reversesEntryId` —
+    // `ledger/src/entries.ts` reverses an entry BY ID and sets that column — and a hand-built
+    // `reversal` posted through `POST /entries` would carry the name with the column null: a
+    // reversal in every report that reverses nothing anybody can point at.
+    //
+    // And the id may not exist. The stake route writes the row and then posts the escrow entry, so
+    // a crash between them leaves `accepted` with `escrow_entry_id` null. That stake still has to
+    // be refundable. A refund that depended on the entry it reverses would be exactly unavailable
+    // in the case the ordering was chosen to make recoverable.
+    //
+    // `market_refund` is not an option at all: the vocabulary is closed
+    // (`contracts/packages/money/src/index.ts` `ENTRY_KINDS`) and there is no such kind. Inventing
+    // one is the defect that stopped every `item_issue` posting for a month.
+    // ────────────────────────────────────────────────────────────────────────────────────────
+    kind: 'market_settled',
+    actor: `service:${deps.producer}`,
+    correlationId: marketId,
+    idempotencyKey: stakeIdempotencyKey(stake.id, 'refund'),
+    description: `Foresight refund on market ${marketId}`.slice(0, 200),
+    postings: refundPostings(stake),
+  })
+  await markRefunded(deps.sql, stake.id, entry.id, now)
+}
+
+/**
+ * Settle one stake out of the platform pool: escrow is spent, and a winner's share arrives.
+ *
+ * A payout of zero is still an entry, and still marks the row `paid`. That is not bookkeeping
+ * pedantry — the escrowed EMBER has to LEAVE the loser's escrow balance, or their available balance
+ * stays short for ever and the pool it was paid out of never balances.
+ */
+async function payOne(
+  deps: JobDeps,
+  stake: CustodialStake,
+  payout: bigint,
+  marketId: string,
+  now: Date,
+): Promise<void> {
+  const entry = await deps.ledger.postEntry({
+    kind: 'market_settled',
+    actor: `service:${deps.producer}`,
+    correlationId: marketId,
+    idempotencyKey: stakeIdempotencyKey(stake.id, 'payout'),
+    description: `Foresight settlement on market ${marketId}`.slice(0, 200),
+    postings: poolPayoutPostings(stake, payout),
+  })
+  await markPaid(deps.sql, stake.id, entry.id, now)
+}
+
 /* ------------------------------------------------------------------ registration */
 
 /**
@@ -480,6 +637,7 @@ export function registerHandlers(
   register(MIRROR_SWEEP, mirrorSweepHandler(deps))
   register(RESOLUTION_POST, resolutionPostHandler(deps))
   register(FEE_REPORT, feeReportHandler(deps))
+  register(CUSTODIAL_SETTLE, custodialSettleHandler(deps))
   register(OUTBOX_RELAY, relay)
 }
 
@@ -531,6 +689,7 @@ export function recurringJobs(deps: ScheduleDeps): RecurringJob[] {
     { kind: MIRROR_SWEEP, key: 'global', everyMs: 30 * SECOND },
     { kind: MARKET_CLOSE, key: 'global', everyMs: 60 * SECOND },
     { kind: FEE_REPORT, key: 'global', everyMs: 60 * SECOND },
+    { kind: CUSTODIAL_SETTLE, key: 'global', everyMs: 60 * SECOND },
     { kind: IDEA_PROPOSE, key: 'global', everyMs: deps.proposeEveryMinutes * MINUTE },
   ]
 }

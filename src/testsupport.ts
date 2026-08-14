@@ -31,6 +31,7 @@ import {
   LedgerRefusedError,
   LedgerUnavailableError,
   type EntryRequest,
+  type LedgerBalance,
   type LedgerClient,
   type PostedEntry,
 } from './ledgerclient.ts'
@@ -409,6 +410,8 @@ export interface FakeLedger extends LedgerClient {
   setDown(down: boolean): void
   /** Forget everything. A fake shared across a file's cases must be reset like the database is. */
   reset(): void
+  /** What the next `balances()` answers with. Empty by default: a user who holds nothing. */
+  setBalances(balances: readonly LedgerBalance[]): void
 }
 
 export function fakeLedger(): FakeLedger {
@@ -416,6 +419,7 @@ export function fakeLedger(): FakeLedger {
   const posted = new Map<string, PostedEntry>()
   let refusal: { status: number; code: string; message: string } | null = null
   let down = false
+  let balances: readonly LedgerBalance[] = []
   return {
     entries,
     setRefusal(next) {
@@ -424,11 +428,21 @@ export function fakeLedger(): FakeLedger {
     setDown(value) {
       down = value
     },
+    setBalances(next) {
+      balances = next
+    },
+    async balances(_subject) {
+      // Down means down for reads too. A panel that showed a balance while a stake could not be
+      // posted would be telling somebody they can act when they cannot.
+      if (down) throw new LedgerUnavailableError('the ledger did not answer')
+      return balances
+    },
     reset() {
       entries.length = 0
       posted.clear()
       refusal = null
       down = false
+      balances = []
     },
     async postEntry(request) {
       if (down) throw new LedgerUnavailableError('the ledger did not answer')
