@@ -772,6 +772,53 @@ export async function custodialPoolOf(
   return { yes: BigInt(row?.yes ?? '0'), no: BigInt(row?.no ?? '0'), stakers: row?.stakers ?? 0 }
 }
 
+/** The custodial book as the market page renders it. Pool units — EMBER — as decimal strings. */
+export interface CustodialPoolView {
+  readonly yes: string
+  readonly no: string
+  readonly total: string
+  /** The split in basis points, in bigint. `null` when nothing has been staked this way. */
+  readonly yesBps: number | null
+  readonly noBps: number | null
+  readonly stakerCount: number
+  /** The unit every figure above is in, so no client has to assume it. */
+  readonly asset: string
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE BOOK A CUSTODIAL STAKER IS IN HAD NO WAY OF REACHING THEM, AND THAT WAS THE WHOLE BUG.**
+ *
+ * `GET /markets/:id` carried `pool` — `positions`, the contract's — and nothing else. So somebody
+ * who staked 10 EMBER through their CloudsForge balance watched the market page go on saying
+ * `yes 0 / no 0 / 0 stakers` afterwards, because a custodial stake is a ledger entry and never
+ * appears in `positions`. Their money was in escrow, their stake was in `custodial_stakes`, and
+ * the only surface that could have told them so was reading the other pool. It was reported as
+ * "I completed one deposit and the total stayed 0".
+ *
+ * So the custodial book goes on the wire — beside the contract's, never summed with it, for the
+ * reason `custodialPoolOf` gives at length directly above.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function custodialPoolView(pool: {
+  readonly yes: bigint
+  readonly no: bigint
+  readonly stakers: number
+}): CustodialPoolView {
+  const total = pool.yes + pool.no
+  return {
+    yes: pool.yes.toString(),
+    no: pool.no.toString(),
+    total: total.toString(),
+    // The same expression as `poolOf` and as `ForesightMarket.sol`: the division happens in
+    // bigint and the result is at most 10,000, so narrowing to a JS number cannot lose a digit.
+    yesBps: total === 0n ? null : Number((pool.yes * 10_000n) / total),
+    noBps: total === 0n ? null : Number((pool.no * 10_000n) / total),
+    stakerCount: pool.stakers,
+    asset: POOL_ASSET,
+  }
+}
+
 /** Every stake still waiting for the market to be over. The settlement job's queue. */
 export async function unresolvedStakes(
   sql: Db | Tx,

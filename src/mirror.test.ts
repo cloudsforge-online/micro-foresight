@@ -20,7 +20,16 @@ import assert from 'node:assert/strict'
 import type postgres from 'postgres'
 import { encodeAbi } from './evm.ts'
 import type { ActivityItem, TransactionView } from './indexerclient.ts'
-import { STAKED_TOPIC, poolOf, positionOf, recordStakes, recordSyncError, syncMarket, type MirrorDeps } from './mirror.ts'
+import {
+  MIRROR_STALE_AFTER_MS,
+  STAKED_TOPIC,
+  poolOf,
+  positionOf,
+  recordStakes,
+  recordSyncError,
+  syncMarket,
+  type MirrorDeps,
+} from './mirror.ts'
 import {
   db,
   enabled,
@@ -286,7 +295,7 @@ test('an empty pool has no ratio rather than a zero one', { skip }, async () => 
   assert.equal(pool.stale, true)
 })
 
-test('the mirror says as of when, and calls itself stale when it is behind the chain', { skip }, async () => {
+test('a complete pass is current to the tip, whatever block the last stake was in', { skip }, async () => {
   const id = await openedMarket()
   const indexer = fakeIndexer()
   const tx = `0x${'88'.repeat(32)}`
@@ -294,20 +303,62 @@ test('the mirror says as of when, and calls itself stale when it is behind the c
   indexer.setTransaction(tx, transaction(tx, 'included', [stakedLog(0, ALICE, 0n, ONE)], 100))
   await syncMarket(await mirrorFor(indexer), id)
 
-  let pool = await poolOf(db(sql), id, 'ember')
+  const pool = await poolOf(db(sql), id, 'ember')
   assert.ok(pool.asOf, 'a pool with no asOf is a pool a reader will assume is live')
-  assert.equal(pool.lastBlock, 100)
+  // The stake was in block 100 and the tip is 110. The mirror is not ten blocks behind: it read
+  // this contract's whole activity as of 110 and there was nothing in the last ten blocks.
+  assert.equal(pool.lastBlock, 110)
   assert.equal(pool.tipBlock, 110)
-  assert.equal(pool.behindBlocks, 10)
-  // Ten blocks behind is inside EMBER's 60-confirmation depth, so it is not stale.
+  assert.equal(pool.behindBlocks, 0)
   assert.equal(pool.stale, false)
+})
 
-  // Now the tip runs away — the mirror has stopped keeping up.
-  indexer.setActivity([activity(tx, 'included', 100)], 400)
+test('an empty market is not a market whose mirror has fallen over', { skip }, async () => {
+  // The regression this test exists for. `last_block` was the highest block a STAKE was found in,
+  // so a market nobody had staked on recorded zero and the page told every reader "32,423 blocks
+  // behind the tip — our copy has fallen behind the chain". Nothing had fallen behind.
+  const id = await openedMarket()
+  const indexer = fakeIndexer()
+  indexer.setActivity([], 32_423)
   await syncMarket(await mirrorFor(indexer), id)
-  pool = await poolOf(db(sql), id, 'ember')
+
+  const pool = await poolOf(db(sql), id, 'ember')
+  assert.equal(pool.total, '0')
+  assert.equal(pool.lastBlock, 32_423)
+  assert.equal(pool.behindBlocks, 0)
+  assert.equal(pool.stale, false, 'an empty pool that was read a second ago is empty, not stale')
+})
+
+test('a truncated page claims only the blocks it recorded, and says it is behind', { skip }, async () => {
+  const id = await openedMarket()
+  const indexer = fakeIndexer()
+  const tx = `0x${'88'.repeat(32)}`
+  indexer.setActivity([activity(tx, 'included', 100)], 400)
+  indexer.setTransaction(tx, transaction(tx, 'included', [stakedLog(0, ALICE, 0n, ONE)], 100))
+  // More pages outstanding: this pass has NOT seen everything the indexer holds for the contract,
+  // so the only height it can vouch for is the one it recorded a stake from.
+  indexer.setTruncated('page-2')
+  await syncMarket(await mirrorFor(indexer), id)
+
+  const pool = await poolOf(db(sql), id, 'ember')
+  assert.equal(pool.lastBlock, 100)
+  assert.equal(pool.tipBlock, 400)
   assert.equal(pool.behindBlocks, 300)
   assert.equal(pool.stale, true, 'a mirror 300 blocks behind should say so')
+})
+
+test('a mirror that ran once and then stopped is stale, however current its blocks look', { skip }, async () => {
+  // The failure the block comparison cannot see: `last_block` and `tip_block` are written by the
+  // same pass, so a mirror that died an hour ago reports `behind = 0` for ever.
+  const id = await openedMarket()
+  const indexer = fakeIndexer()
+  indexer.setActivity([], 110)
+  await syncMarket(await mirrorFor(indexer), id)
+
+  const later = new Date(Date.now() + MIRROR_STALE_AFTER_MS + 60_000)
+  const pool = await poolOf(db(sql), id, 'ember', later)
+  assert.equal(pool.behindBlocks, 0)
+  assert.equal(pool.stale, true, 'a mirror nobody has run for an hour is not a current pool')
 })
 
 test('an indexer outage is a degraded read, recorded, and never a wrong pool', { skip }, async () => {

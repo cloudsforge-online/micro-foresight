@@ -82,6 +82,8 @@ import { poolOf, positionOf } from './mirror.ts'
 import {
   CustodialStakeError,
   acceptStake,
+  custodialPoolOf,
+  custodialPoolView,
   custodialPositionOf,
   escrowPostings,
   findStakeAsset,
@@ -679,6 +681,11 @@ function buildRoutes(): Route[] {
       const market = await findMarket(deps.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       const pool = await poolOf(deps.sql, id, market.chain as ChainId)
+      // The OTHER book on the same question — see `custodialPoolView`. Served beside `pool` and
+      // never folded into it: a reader staking from their CloudsForge balance is paid out of this
+      // one, and until it was on the wire the page showed them a market they had staked on
+      // reading `0` on both sides.
+      const custodialPool = custodialPoolView(await custodialPoolOf(deps.sql, id))
       const idea = market.ideaId ? await findIdea(deps.sql, market.ideaId) : null
       // The house seed DISCLOSURE — 21 §5's sentence, served whenever a house stake exists
       // (21 §7.6), with the composed sentence, the amounts, the address and the evidence hashes.
@@ -690,6 +697,7 @@ function buildRoutes(): Route[] {
         body: {
           market: publicView(market, deps.studioPublicUrl),
           pool,
+          custodialPool,
           houseSeed: houseSeed ? houseSeedView(houseSeed) : null,
           document: {
             canonical: canonicalDocument(documentFor(market)),
