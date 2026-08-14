@@ -216,9 +216,26 @@ export async function syncMarket(deps: MirrorDeps, marketId: string): Promise<Sy
 
   const recorded = await recordStakes(deps.sql, marketId, stakes)
 
+  /*
+   * ── `last_block` IS HOW FAR THIS MIRROR HAS READ, NOT WHERE THE LAST STAKE WAS ────────────────
+   *
+   * It used to be `maxBlock(stakes)`, which is ZERO for every market nobody has staked on yet. So
+   * `poolOf` computed `behind = tip - 0` and every empty market carried the alarm meant for a
+   * mirror that had genuinely fallen over: "▲ 32,423 blocks behind the tip. Our copy has fallen
+   * behind the chain, so treat these numbers as having moved." Nothing had moved. The pass had
+   * read the contract's entire activity as of the tip and found nothing, which is the ordinary
+   * state of a new market and the exact opposite of what the reader was told.
+   *
+   * Coverage can only be claimed when the page was not truncated. `nextCursor === null` means the
+   * indexer had nothing further for this address, so the mirror's copy is current to `tipHeight`.
+   * With more pages outstanding the honest answer is unchanged: the highest block a stake has been
+   * recorded from, which is all this pass can vouch for.
+   */
+  const covered = page.nextCursor === null ? (page.tipHeight ?? maxBlock(stakes)) : maxBlock(stakes)
+
   await deps.sql`
     insert into mirror_cursors (market_id, last_block, tip_block, synced_at, last_error)
-    values (${marketId}, ${maxBlock(stakes)}, ${page.tipHeight}, now(), null)
+    values (${marketId}, ${covered}, ${page.tipHeight}, now(), null)
     on conflict (market_id) do update
       set last_block = greatest(mirror_cursors.last_block, excluded.last_block),
           tip_block  = excluded.tip_block,
@@ -295,7 +312,26 @@ export interface PoolView {
  * `numeric(78,0)` and `sum()`, never a JavaScript reduce over floats. Orphaned rows are excluded by
  * the WHERE clause rather than subtracted afterwards, so a reorg cannot leave a negative residue.
  */
-export async function poolOf(sql: Db, marketId: string, chain: ChainId): Promise<PoolView> {
+/**
+ * How long the mirror may go unread before the pool calls itself stale.
+ *
+ * `mirror.sweep` enqueues a sync for every followable market every 30 seconds (`jobs.ts`), so this
+ * is ten missed passes — long enough that a slow sweep on a big queue is not an alarm, short enough
+ * that a mirror which has genuinely stopped is caught before anybody stakes against its numbers.
+ *
+ * It exists because the block comparison alone cannot see this failure. `last_block` and `tip_block`
+ * are both written by the same pass, so a mirror that stopped running an hour ago goes on reporting
+ * `behind = 0` — perfectly current, as of an hour ago. THAT is what "our copy has fallen behind the
+ * chain" was always meant to catch.
+ */
+export const MIRROR_STALE_AFTER_MS = 5 * 60_000
+
+export async function poolOf(
+  sql: Db,
+  marketId: string,
+  chain: ChainId,
+  now: Date = new Date(),
+): Promise<PoolView> {
   const rows = await sql<
     { yes: string | null; no: string | null; stakers: number }[]
   >`
@@ -333,8 +369,12 @@ export async function poolOf(sql: Db, marketId: string, chain: ChainId): Promise
     tipBlock,
     behindBlocks: behind,
     // A mirror that has never run is stale, not empty. The two look identical in the numbers above
-    // and they mean opposite things to somebody about to stake.
-    stale: cursor?.synced_at == null || (behind !== null && behind > requiredConfirmations(chain)),
+    // and they mean opposite things to somebody about to stake. A mirror that ran and then STOPPED
+    // is the third case, and it used to read as current — see `MIRROR_STALE_AFTER_MS`.
+    stale:
+      cursor?.synced_at == null ||
+      now.getTime() - cursor.synced_at.getTime() > MIRROR_STALE_AFTER_MS ||
+      (behind !== null && behind > requiredConfirmations(chain)),
   }
 }
 

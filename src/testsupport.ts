@@ -271,12 +271,18 @@ export interface FakeIndexer extends IndexerClient {
   setTransaction(hash: string, view: TransactionView | null): void
   /** Make every call throw, to exercise the degraded path. */
   setDown(down: boolean): void
+  /**
+   * Answer with more pages outstanding. A truncated page is the one case where the mirror has NOT
+   * covered the address up to the tip, and `syncMarket` records a different `last_block` for it.
+   */
+  setTruncated(cursor: string | null): void
 }
 
 export function fakeIndexer(): FakeIndexer {
   let items: readonly ActivityItem[] = []
   let tip: number | null = 100
   let down = false
+  let nextCursor: string | null = null
   const transactions = new Map<string, TransactionView | null>()
   const guard = () => {
     if (down) throw new Error('indexer is down')
@@ -292,12 +298,15 @@ export function fakeIndexer(): FakeIndexer {
     setDown(value) {
       down = value
     },
+    setTruncated(cursor) {
+      nextCursor = cursor
+    },
     async watch() {
       guard()
     },
     async activity() {
       guard()
-      return { tipHeight: tip, requiredConfirmations: 60, items, nextCursor: null }
+      return { tipHeight: tip, requiredConfirmations: 60, items, nextCursor }
     },
     async transaction(_chain, _network, hash) {
       guard()
