@@ -214,6 +214,17 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       labels: ['outcome'],
     })
     .register({
+      name: 'foresight_custodial_settlements_total',
+      help:
+        'Markets whose custodial pool was settled, by what happened: `paid` divided the losers ' +
+        'among the winners, `void_refund` gave everything back, `no_winner_refund` did too ' +
+        'because nobody backed the winning outcome. Never registering it is not free — the ' +
+        'telemetry client DROPS a write to an unregistered name, so the only exit from escrow ' +
+        'would have been invisible.',
+      kind: 'counter',
+      labels: ['outcome'],
+    })
+    .register({
       name: 'foresight_markets_closed_total',
       help: 'Markets closed by the close job. Bookkeeping: the contract closes itself.',
       kind: 'counter',

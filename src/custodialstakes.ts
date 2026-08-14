@@ -56,7 +56,15 @@ import {
   type StakeRates,
 } from './stakeassets.ts'
 
-export type CustodialStakeState = 'accepted' | 'staked' | 'settled' | 'refunded'
+/**
+ * `paid` is the terminal state of a stake the chain never saw — see migration 12.
+ *
+ * `settled` and `paid` both mean "this market is over and this position was resolved", and they
+ * are two states rather than one because only the first is a claim about a transaction. A
+ * reconciler comparing the ledger against the contract must be able to tell them apart without
+ * reading a nullable column and guessing what its emptiness meant.
+ */
+export type CustodialStakeState = 'accepted' | 'staked' | 'settled' | 'refunded' | 'paid'
 
 export interface CustodialStake {
   readonly id: string
@@ -429,6 +437,32 @@ export async function markSettled(
   return toStake(row)
 }
 
+/**
+ * The platform's own pool paid this position out. The chain was never involved.
+ *
+ * From `accepted` only, and it is the counterpart of `markRefunded` rather than of `markSettled`:
+ * both leave `tx_hash` null for ever, and the schema enforces it
+ * (`custodial_stakes_paid_never_staked`). The difference between them is what the market did — a
+ * void gives back exactly what was taken, a resolution divides the losing side among the winning
+ * one.
+ */
+export async function markPaid(
+  sql: Db | Tx,
+  id: string,
+  entryId: string,
+  at: Date,
+): Promise<CustodialStake> {
+  const rows = await sql<StakeRow[]>`
+    update custodial_stakes
+       set state = 'paid', settle_entry_id = ${entryId}, resolved_at = ${at}, updated_at = now()
+     where id = ${id} and state = 'accepted'
+    returning ${sql.unsafe(COLUMNS)}
+  `
+  const row = rows[0]
+  if (!row) throw new CustodialStakeError('conflict', 'only an accepted stake can be paid from the platform pool')
+  return toStake(row)
+}
+
 /* ------------------------------------------------------------------ the ledger side */
 
 /**
@@ -625,6 +659,23 @@ export function settlementPostings(stake: CustodialStake, payoutWei: bigint): re
 }
 
 /**
+ * The platform's pool paid this position out. **Same postings as a chain settlement, different
+ * authority for the number**, and the distinction is the whole reason this wrapper exists rather
+ * than a second call to `settlementPostings` at the call site.
+ *
+ * `settlementPostings` is documented as mirroring what the CONTRACT paid — read from the chain,
+ * never computed here, because 19 §2.3.1 forbids this service having an opinion about money the
+ * contract holds. That rule is intact. This payout is a different number about different money:
+ * the platform's own escrow, divided by `splitPayouts` among people whose stake never reached the
+ * chain and never could. There is no contract to mirror, so the arithmetic has to live here — and
+ * naming it separately is what keeps somebody from later "simplifying" the two into one path and
+ * quietly making this service the authority on the contract's pool.
+ */
+export function poolPayoutPostings(stake: CustodialStake, payoutWei: bigint): readonly Posting[] {
+  return settlementPostings(stake, payoutWei)
+}
+
+/**
  * One key per stake per phase, for ever.
  *
  * Derived from the stake's own id rather than from a timestamp or a counter: the whole value of an
@@ -632,7 +683,7 @@ export function settlementPostings(stake: CustodialStake, payoutWei: bigint): re
  * and a key that changes between attempts provides none of it. `ledgerclient.ts` makes the same
  * argument for the fee report.
  */
-export function stakeIdempotencyKey(stakeId: string, phase: 'escrow' | 'refund' | 'settle'): string {
+export function stakeIdempotencyKey(stakeId: string, phase: 'escrow' | 'refund' | 'settle' | 'payout'): string {
   return `foresight:stake:${phase}:${stakeId}`
 }
 
@@ -679,6 +730,148 @@ export async function aggregateShares(
   }))
 }
 
+/**
+ * The platform's own pool on one market, per outcome — the figure a custodial staker's return
+ * actually depends on.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS IS NOT THE CONTRACT'S POOL AND MUST NEVER BE ADDED TO IT.**
+ *
+ * `positions` mirrors what the contract holds, staked by people with keys. This sums what the
+ * platform holds for people without one. They are two parimutuel pools on one question, and they
+ * settle independently: a custodial staker divides the custodial losers' money, and nothing else.
+ * Presenting a total of the two would quote somebody odds computed from money they cannot win.
+ *
+ * `accepted` and `paid` both count. `accepted` is money in the pool right now; `paid` is money
+ * that was in it and has been paid out of it, which is what makes this readable after settlement
+ * and lets the split be recomputed and checked. `refunded` never counts — it is money the
+ * platform gave back rather than money that took a side.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function custodialPoolOf(
+  sql: Db | Tx,
+  marketId: string,
+): Promise<{ yes: bigint; no: bigint; stakers: number }> {
+  const rows = await sql<{ yes: string | null; no: string | null; stakers: number }[]>`
+    select
+      sum(pool_amount) filter (where outcome = 0)::text as yes,
+      sum(pool_amount) filter (where outcome = 1)::text as no,
+      count(distinct subject)::int as stakers
+      from custodial_stakes
+     where market_id = ${marketId} and state in ('accepted','paid')
+  `
+  const row = rows[0]
+  return { yes: BigInt(row?.yes ?? '0'), no: BigInt(row?.no ?? '0'), stakers: row?.stakers ?? 0 }
+}
+
+/** Every stake still waiting for the market to be over. The settlement job's queue. */
+export async function unresolvedStakes(
+  sql: Db | Tx,
+  marketId: string,
+): Promise<readonly CustodialStake[]> {
+  const rows = await sql<StakeRow[]>`
+    select ${sql.unsafe(COLUMNS)} from custodial_stakes
+     where market_id = ${marketId} and state = 'accepted'
+     order by created_at, id
+  `
+  return rows.map(toStake)
+}
+
+/**
+ * Markets that are over and still holding somebody's custodial money.
+ *
+ * The join is the point. A stake in `accepted` is money in escrow, and escrow is not a resting
+ * place: it is a promise that something will decide what happens to it. Until this query existed
+ * nothing ever asked the question, so the promise had no keeper — a market could resolve, settle,
+ * be voided, and the escrow row would sit at `accepted` for ever with the user's balance short by
+ * exactly the amount they staked.
+ *
+ * `resolved`, `settled` and `void` are all terminal enough to pay against. `settled` is included
+ * deliberately: it means the CONTRACT's own settlement completed, which says nothing about the
+ * platform's pool — the two settle independently and the on-chain one usually finishes first.
+ */
+export async function marketsAwaitingCustodialSettlement(
+  sql: Db | Tx,
+  limit: number,
+): Promise<readonly { marketId: string; status: string; outcome: number | null }[]> {
+  const rows = await sql<{ market_id: string; status: string; outcome: number | null }[]>`
+    select distinct m.id as market_id, m.status, m.outcome
+      from custodial_stakes s
+      join markets m on m.id = s.market_id
+     where s.state = 'accepted' and m.status in ('resolved','settled','void')
+     order by m.id
+     limit ${limit}
+  `
+  return rows.map((row) => ({ marketId: row.market_id, status: row.status, outcome: row.outcome }))
+}
+
+export interface Payout {
+  readonly stakeId: string
+  /** What this staker receives, in pool units. Their own stake back, plus their share of the losers'. */
+  readonly payout: bigint
+}
+
+/**
+ * Divide a resolved market's custodial pool.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * PARIMUTUEL, AND THEREFORE SELF-FUNDED: the only money paid out is money that was staked. The
+ * platform is not the counterparty to any of it and cannot owe what it does not hold. Every
+ * function of this shape has three edges, and getting any of them wrong is somebody's money:
+ *
+ *   1. **Nobody backed the winning outcome.** There is no division to make — one side is empty
+ *      and the other cannot win against nothing. Every stake comes back whole, which the caller
+ *      does as a refund in the ASSET IT ARRIVED IN, not as a pool-unit payout. So this returns an
+ *      empty list and says so, rather than inventing a payout equal to the stake.
+ *   2. **Nobody backed the losing outcome.** Everybody who staked was right, there is nothing to
+ *      divide, and each winner takes back exactly what they put in.
+ *   3. **The division does not come out whole.** `share = pool_i * losers / winners` floors, so
+ *      the floors leave a remainder of up to (number of winners − 1) units. It is not the
+ *      platform's, and it is not left in a clearing account to be found by an accountant in a
+ *      year: it is handed out one unit at a time, largest stake first, ties broken by stake id.
+ *      Deterministic, exhaustive, and the total paid equals the total staked to the unit.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function splitPayouts(
+  stakes: readonly CustodialStake[],
+  winningOutcome: number,
+): readonly Payout[] {
+  const winners = stakes.filter((stake) => stake.outcome === winningOutcome)
+  const losers = stakes.filter((stake) => stake.outcome !== winningOutcome)
+  if (winners.length === 0) return []
+
+  const winningPool = winners.reduce((sum, stake) => sum + stake.poolAmount, 0n)
+  const losingPool = losers.reduce((sum, stake) => sum + stake.poolAmount, 0n)
+  if (winningPool <= 0n) return []
+
+  const payouts = new Map<string, bigint>()
+  let distributed = 0n
+  for (const stake of winners) {
+    const share = (stake.poolAmount * losingPool) / winningPool
+    payouts.set(stake.id, stake.poolAmount + share)
+    distributed += share
+  }
+
+  // The remainder, one unit at a time. Sorted here rather than relying on the caller's order: the
+  // rule has to be a property of this function, or two callers reading the same rows in different
+  // orders would pay different people.
+  let remainder = losingPool - distributed
+  const byClaim = [...winners].sort((a, b) =>
+    a.poolAmount === b.poolAmount ? (a.id < b.id ? -1 : 1) : a.poolAmount > b.poolAmount ? -1 : 1,
+  )
+  let index = 0
+  while (remainder > 0n && byClaim.length > 0) {
+    const stake = byClaim[index % byClaim.length] as CustodialStake
+    payouts.set(stake.id, (payouts.get(stake.id) ?? 0n) + 1n)
+    remainder -= 1n
+    index += 1
+  }
+
+  return stakes
+    .filter((stake) => payouts.has(stake.id))
+    .map((stake) => ({ stakeId: stake.id, payout: payouts.get(stake.id) as bigint }))
+}
+
 /** One user's custodial position in a market, in the pool's unit. The unit they will be paid in. */
 export async function custodialPositionOf(
   sql: Db | Tx,
@@ -691,7 +884,7 @@ export async function custodialPositionOf(
       sum(pool_amount) filter (where outcome = 1)::text as no
       from custodial_stakes
      where market_id = ${marketId} and subject = ${subject}
-       and state in ('accepted','staked','settled')
+       and state in ('accepted','staked','settled','paid')
   `
   const row = rows[0]
   return { yes: BigInt(row?.yes ?? '0'), no: BigInt(row?.no ?? '0') }

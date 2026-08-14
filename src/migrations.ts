@@ -1191,6 +1191,78 @@ export const MIGRATIONS: readonly Migration[] = [
       -- a write cost and a page cache eviction paid for ever in exchange for nothing.
     `,
   },
+  {
+    version: 12,
+    name: 'custodial_paid_state',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- MONEY COULD GET IN AND HAD NO WAY OUT.
+      --
+      -- 'custodial_stakes' shipped with four states and three of them were unreachable. A stake is
+      -- taken as 'accepted'; 'staked' needs a transaction hash, which needs the platform's
+      -- aggregate to be ON CHAIN, which needs a key that will call 'stake(uint8)' — and no such
+      -- key exists in this estate on purpose. custody's SIGNABLE_PURPOSES is
+      -- {deployer, treasury, deposit}, every one of them bound to a shape that is a creation, a
+      -- bare transfer or a sweep (custody/src/signing.ts), and widening it to "call a contract"
+      -- is refused there in as many words. 'markSettled' only accepts 'staked'. So a user's money
+      -- could enter escrow and nothing in the system could ever take it out again.
+      --
+      -- ── THE FIX IS A FIFTH STATE, NOT A RELAXED CONSTRAINT ───────────────────────────────────
+      --
+      -- The obvious repair — let 'settled' happen without a transaction hash — would have deleted
+      -- the one check that says a claim about the chain must carry evidence
+      -- ('custodial_stakes_staked_has_evidence'), and every reconciler reading these rows would
+      -- have quietly started believing positions that were never broadcast.
+      --
+      -- So a stake settled in the ledger and never on the chain ends as 'paid', and 'paid' is
+      -- constrained to be exactly that: no transaction hash, ever. A row's terminal state now says
+      -- WHICH of the two worlds resolved it, which is the fact a reconciliation needs and the one
+      -- a shared state would have destroyed.
+      --
+      -- ── WHAT 'paid' MEANS FOR THE MONEY, WHICH IS THE PART THAT MATTERS ──────────────────────
+      --
+      -- Custodial stakes form their own parimutuel pool, held by the platform, settled against the
+      -- outcome the market resolved to on chain. The winning side divides the losing side's
+      -- escrow in proportion to what each staker put in. It is self-funded by construction: the
+      -- only money paid out is money that was staked, so the platform is never the counterparty
+      -- and cannot owe more than it holds. Nobody on the winning side means nobody won anything —
+      -- every stake is refunded whole, in the asset it arrived in.
+      --
+      -- This is NOT the on-chain pool and the surfaces say so. Mixing the two figures would be the
+      -- lie: a custodial staker's return is decided by who else staked custodially, and telling
+      -- them otherwise would be quoting odds from money they cannot win.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      alter table custodial_stakes drop constraint if exists custodial_stakes_state_ck;
+      alter table custodial_stakes add constraint custodial_stakes_state_ck
+        check (state in ('accepted','staked','settled','refunded','paid'));
+
+      alter table custodial_stakes drop constraint if exists custodial_stakes_terminal_has_time;
+      alter table custodial_stakes add constraint custodial_stakes_terminal_has_time
+        check (state not in ('settled','refunded','paid') or resolved_at is not null);
+
+      -- A paid stake is one the chain never saw. If it ever carried a hash it belonged in
+      -- 'settled', and the difference is the whole reason this state exists.
+      alter table custodial_stakes drop constraint if exists custodial_stakes_paid_never_staked;
+      alter table custodial_stakes add constraint custodial_stakes_paid_never_staked
+        check (state <> 'paid' or tx_hash is null);
+
+      -- A paid stake also carries the entry that paid it, exactly as a settled one does.
+      alter table custodial_stakes drop constraint if exists custodial_stakes_paid_has_entry;
+      alter table custodial_stakes add constraint custodial_stakes_paid_has_entry
+        check (state not in ('settled','refunded','paid') or settle_entry_id is not null);
+
+      -- The pool read counts 'paid' too: it is a stake that was in the platform's pool and was
+      -- resolved out of it, which is what 'settled' means for the chain-side one.
+      drop index if exists custodial_stakes_market_idx;
+      create index if not exists custodial_stakes_market_idx
+        on custodial_stakes (market_id, outcome)
+        where state in ('accepted','staked','settled','paid');
+
+      -- The settlement job's queue: taken, and not yet resolved either way.
+      create index if not exists custodial_stakes_unresolved_idx
+        on custodial_stakes (market_id) where state = 'accepted';
+    `,
+  },
 ]
 
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

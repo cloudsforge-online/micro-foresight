@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 import type postgres from 'postgres'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import {
+  CUSTODIAL_SETTLE,
   DEPLOY_SWEEP,
   FEE_REPORT,
   IDEA_PROPOSE,
@@ -31,6 +32,7 @@ import {
   PROPOSAL_TOPICS,
   RESOLUTION_POST,
   applyConfirmedResolution,
+  custodialSettleHandler,
   deploySweepHandler,
   feeReportHandler,
   ideaProposeHandler,
@@ -87,6 +89,10 @@ function ledgerRecording(posted: EntryRequest[]): LedgerClient {
     async postEntry(request) {
       posted.push(request)
       return { id: `entry-${posted.length}`, kind: request.kind, recordedAt: new Date().toISOString(), replayed: false }
+    },
+    // No job reads a balance; the panel does. A fake that invented one would be lying quietly.
+    async balances() {
+      return []
     },
   }
 }
@@ -470,6 +476,7 @@ test('a confirmed void becomes a voided market with the rationale as the reason'
 test('every job kind has a documented lease key, and the recurring ones are seeded once', { skip }, async () => {
   const queue = new JobQueue(sql as unknown as JobsSql, { owner: 'w', leaseMs: 60_000 })
   assert.deepEqual([...JOB_KINDS].sort(), [
+    CUSTODIAL_SETTLE,
     DEPLOY_SWEEP,
     FEE_REPORT,
     IDEA_PROPOSE,
@@ -492,6 +499,7 @@ test('every job kind has a documented lease key, and the recurring ones are seed
   assert.deepEqual(
     rows.map((row) => `${row.kind}:${row.key}`).sort(),
     [
+      `${CUSTODIAL_SETTLE}:global`,
       `${DEPLOY_SWEEP}:global`,
       `${FEE_REPORT}:global`,
       `${IDEA_PROPOSE}:global`,

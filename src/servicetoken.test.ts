@@ -321,7 +321,14 @@ function jobDepsFor(queue: JobQueue, custody: ReturnType<typeof upstreamsFor>['c
     deploy,
     resolve: {} as ResolveDeps,
     mirror: { sql: db(sql), indexer: fakeIndexer(), pageSize: 10, logger, metrics },
-    ledger: { async postEntry() { throw new Error('not used') } },
+    ledger: {
+      async postEntry() {
+        throw new Error('not used')
+      },
+      async balances() {
+        throw new Error('not used')
+      },
+    },
   }
 }
 
