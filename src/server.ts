@@ -160,8 +160,19 @@ export interface ServerDeps {
    * house seed's arrangement, for the house seed's reason (`houseseed.ts`, and
    * `custody/src/gates.ts`, which does not sign for a user and must not learn to).
    *
-   * Undefined is a supported mode: this deployment takes wallet stakes only, and every custodial
-   * route refuses plainly rather than half-working.
+   * Undefined is the ORDINARY case, and no longer switches custodial staking off.
+   *
+   * It used to. `custodialStakingAvailable` was `custodialAddress !== undefined`, the variable was
+   * unset on both networks, and the consequence was the report that started this work: the only
+   * way to take a side on Forge Foresight was to install a browser wallet. The variable was unset
+   * deliberately — until migration 12 there was no route out of custodial escrow, so setting it
+   * would have taken a stranger's coins with no way to give them back.
+   *
+   * There is one now, and it never touches the chain: a custodial stake is settled in the ledger
+   * against the outcome the market resolved to on chain (`custodialstakes.ts`, state `paid`). So
+   * this address is not what makes custodial staking possible and never was — the ledger is. When
+   * it is set the accepted stake records it, and the on-chain aggregate, if it is ever built, has
+   * its evidence. When it is unset the column is null, which migration 13 permits.
    */
   readonly custodialAddress: string | undefined
   /**
@@ -814,7 +825,9 @@ function buildRoutes(): Route[] {
           // Said once, at the top, because it is the fact everything below depends on: the pool is
           // one unit and it is this one. See `stakeassets.ts` for why the alternative was refused.
           poolAsset: POOL_ASSET,
-          custodialStakingAvailable: deps.custodialAddress !== undefined,
+          // TRUE, because the ledger is what settles a custodial stake — see `custodialAddress`
+          // on Deps for the whole of why this used to read the address and was wrong to.
+          custodialStakingAvailable: true,
           disclosure: stakeDisclosure(),
           assets: assets.map((asset) => ({
             assetCode: asset.assetCode,
@@ -897,15 +910,10 @@ function buildRoutes(): Route[] {
           ctx.requestId,
         )
       }
-      const custodialAddress = deps.custodialAddress
-      if (custodialAddress === undefined) {
-        return errorReply(
-          503,
-          'custodial_staking_unconfigured',
-          'this deployment takes wallet stakes only: no platform staking address is configured',
-          ctx.requestId,
-        )
-      }
+      // No refusal here any more. There is nothing to be unconfigured: the stake is escrowed in
+      // the ledger and settled from it, and `platformAddress` is recorded when the estate happens
+      // to have one. A 503 on an unset variable was refusing a working path.
+      const custodialAddress = deps.custodialAddress ?? null
       const id = uuidParam(ctx, 'id')
       const clientKey = idempotencyKeyOf(ctx)
       const body = await readJson(ctx.req)
@@ -1028,6 +1036,69 @@ function buildRoutes(): Route[] {
           stake: stakeSummary(recorded),
           quote: quoteView(quote),
           disclosure: stakeDisclosure(),
+        },
+      }
+    }),
+
+    /**
+     * WHAT THE READER CAN ACTUALLY BET WITH — their own balances, per accepted stake asset.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * The stake panel used to offer a list of currencies and no numbers, so the only way to learn
+     * you had none of something was to type an amount and be refused by the ledger. That is a
+     * refusal arriving after the decision, which is the shape of every bad money screen.
+     *
+     * **It is a READ and it is never the thing that refuses a stake.** The ledger's own overdraft
+     * trigger is, on the account that actually holds the number — see `POST /markets/:id/stakes`,
+     * which deliberately does not check a balance first. A figure read here is a figure from a
+     * moment ago; treating it as authority would put the window between the two reads inside the
+     * overdraft it was supposed to prevent.
+     *
+     * A ledger that cannot be reached answers `degraded: true` and null amounts rather than 503.
+     * The panel must still render: staking works without knowing the balance, and hiding the form
+     * because a display figure is missing would turn a cosmetic outage into a functional one.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('GET', '/me/stake-balances', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind !== 'user') {
+        return errorReply(
+          403,
+          'not_a_user',
+          'a balance belongs to a user; a service holds none here',
+          ctx.requestId,
+        )
+      }
+      const subject = subjectOf(principal)
+      const assets = await listStakeAssets(deps.sql)
+      let held: readonly { assetCode: string; purpose: string; amount: string; status: string }[] = []
+      let degraded = false
+      try {
+        held = await deps.ledger.balances(subject)
+      } catch (err) {
+        if (!(err instanceof LedgerUnavailableError)) throw err
+        degraded = true
+        ctx.log.warn('stake balances unread: the ledger was unavailable', { err: err.message })
+      }
+      // `available` only. `escrow` is money already committed to a market and offering it as
+      // spendable would invite somebody to stake the same coins twice.
+      const spendable = new Map(
+        held.filter((row) => row.purpose === 'available').map((row) => [row.assetCode, row.amount]),
+      )
+      return {
+        status: 200,
+        body: {
+          poolAsset: POOL_ASSET,
+          custodialStakingAvailable: true,
+          degraded,
+          assets: assets.map((asset) => ({
+            assetCode: asset.assetCode,
+            displayName: asset.displayName,
+            decimals: asset.decimals,
+            enabled: asset.enabled,
+            blockedReason: asset.blockedReason,
+            available: degraded ? null : (spendable.get(asset.assetCode) ?? '0'),
+          })),
         },
       }
     }),
