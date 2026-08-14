@@ -1263,6 +1263,53 @@ export const MIGRATIONS: readonly Migration[] = [
         on custodial_stakes (market_id) where state = 'accepted';
     `,
   },
+  {
+    version: 13,
+    name: 'custodial_pool_needs_no_chain_address',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- THE PANEL WAS INVISIBLE, AND THE COLUMN IS WHY.
+      --
+      -- \`custodialStakingAvailable\` is \`deps.custodialAddress !== undefined\`, fed by
+      -- FORESIGHT_CUSTODIAL_ADDRESS, which is unset on both networks. One unset variable makes
+      -- \`CustodialStakePanel\` return null, so the only way to take a side on Forge Foresight is
+      -- to install a browser wallet — the report this whole line of work started from.
+      --
+      -- The variable was left unset ON PURPOSE, and the reason is recorded in the estate compose
+      -- file: setting it would have escrowed a stranger's coins with no way to stake, refund or
+      -- settle them, because the lifecycle after 'accepted' had no route. Migration 12 built that
+      -- route. The comment's own condition — "a switch that must not be thrown until foresight can
+      -- finish what it starts" — is now met.
+      --
+      -- ── SO WHY NOT JUST SET THE VARIABLE ─────────────────────────────────────────────────────
+      --
+      -- Because there is nothing for it to hold. \`platform_address\` was declared \`not null\` when
+      -- the design was "the platform aggregates custodial stakes and places them on chain as one
+      -- position", and that design is dead: \`stake(uint8)\` is a value-bearing CALL with calldata,
+      -- and SIGNABLE_PURPOSES in custody is {deployer, treasury, deposit} — no key in this estate
+      -- can place it. A stake settled through 'paid' never touches the chain, so demanding an
+      -- address for it is demanding a key nobody will ever use, and minting one would say this
+      -- money is going somewhere it is not.
+      --
+      -- The column stays, because the on-chain aggregate may yet be built and these rows would be
+      -- its evidence. It becomes NULLABLE, and a constraint ties it to the only state that could
+      -- ever have needed it: a row that claims the chain saw it must say from where.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      alter table custodial_stakes alter column platform_address drop not null;
+
+      -- The shape check has to tolerate null now — a null address is 'this never went on chain',
+      -- not 'this went on chain to something malformed'.
+      alter table custodial_stakes drop constraint if exists custodial_stakes_address_shape;
+      alter table custodial_stakes add constraint custodial_stakes_address_shape
+        check (platform_address is null or platform_address ~ '^0x[0-9a-f]{40}$');
+
+      -- And the tie: 'staked' and 'settled' are the two states that assert the chain saw this
+      -- stake. Both already require a tx_hash; both now also require the address it came from.
+      alter table custodial_stakes drop constraint if exists custodial_stakes_onchain_has_address;
+      alter table custodial_stakes add constraint custodial_stakes_onchain_has_address
+        check (state not in ('staked','settled') or platform_address is not null);
+    `,
+  },
 ]
 
 export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

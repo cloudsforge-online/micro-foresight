@@ -75,7 +75,14 @@ export interface CustodialStake {
   readonly stakeAmount: bigint
   readonly poolAmount: bigint
   readonly rates: StakeRates
-  readonly platformAddress: string
+  /**
+   * The address the platform would have staked this from, or null when nothing ever will.
+   *
+   * Null is the ordinary case and not a gap: a stake resolved through `paid` is settled in the
+   * ledger and never reaches the chain, so there is no address it came from. Migration 13 ties a
+   * non-null value to the two states that assert the chain saw the stake.
+   */
+  readonly platformAddress: string | null
   readonly state: CustodialStakeState
   readonly escrowEntryId: string | null
   readonly settleEntryId: string | null
@@ -96,7 +103,7 @@ interface StakeRow {
   readonly pool_amount: string
   readonly stake_rate_usd_scaled: string
   readonly pool_rate_usd_scaled: string
-  readonly platform_address: string
+  readonly platform_address: string | null
   readonly state: string
   readonly escrow_entry_id: string | null
   readonly settle_entry_id: string | null
@@ -293,7 +300,8 @@ export interface AcceptInput {
   readonly subject: string
   readonly outcome: number
   readonly quote: StakeQuote
-  readonly platformAddress: string
+  /** Optional, and normally absent — see `CustodialStake.platformAddress`. */
+  readonly platformAddress: string | null
   readonly idempotencyKey: string
 }
 
@@ -325,7 +333,7 @@ export async function acceptStake(tx: Tx, input: AcceptInput): Promise<Custodial
       ${denomination.poolAmount.toString()},
       ${denomination.rates.stakeUsdScaled.toString()},
       ${denomination.rates.poolUsdScaled.toString()},
-      ${input.platformAddress.toLowerCase()}, ${input.idempotencyKey}
+      ${input.platformAddress?.toLowerCase() ?? null}, ${input.idempotencyKey}
     )
     returning ${tx.unsafe(COLUMNS)}
   `
