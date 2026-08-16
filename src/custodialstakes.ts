@@ -953,11 +953,31 @@ export async function custodialPositionOf(
  * have opposite failure modes is that problem in its purest form. So the difference is stated, in
  * the platform's own words, composed once — the house seed's disclosure is composed the same way
  * and for the same reason.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS SENTENCE ONCE SAID SOMETHING THE SERVICE CANNOT DO, AND IT SAID IT TO EVERY USER.**
+ *
+ * Until 2026-08-16 it read "the platform places the pool share on chain from its own published
+ * address". It never did, and it never can: `markSettled` accepts only a stake in state `'staked'`,
+ * `'staked'` requires a transaction hash, and the hash could only come from custody signing
+ * `stake(uint8)` — which `SIGNABLE_PURPOSES` in custody refuses, because it is a value-bearing call
+ * with calldata. See `custodialSettleHandler` in `jobs.ts` for the full argument. On mainnet the
+ * market with 10 EMBER of custodial stake held a contract pool of exactly zero, on both outcomes,
+ * with a zero contract balance — which is the designed behaviour, not a fault.
+ *
+ * So the disclosure now describes the design as built: the platform holds the money, the custodial
+ * stakes form their own parimutuel pool, and that pool settles against the outcome the CHAIN
+ * resolved. Anyone rewriting this must say where the money actually sits. A disclosure that
+ * overstates the on-chain guarantee is worse than none, because it is the sentence a user reads
+ * *instead of* asking.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export function stakeDisclosure(): string {
   return (
-    'A custodial stake is held for you: the platform places the pool share on chain from its own ' +
-    'published address and your share is recorded in the ledger. A wallet stake is yours in the ' +
+    'A custodial stake is held by the platform: your EMBER moves to the platform and your side is ' +
+    'recorded in the ledger. It does not go into the market contract. Custodial stakes settle ' +
+    'among themselves, against the outcome the chain resolves, so your return comes from the ' +
+    'custodial pool shown here and not from the contract pool. A wallet stake is yours in the ' +
     'contract — it can be claimed with a wallet and a block explorer even if this platform stops ' +
     'running. A custodial stake cannot.'
   )
