@@ -1,5 +1,5 @@
 /**
- * The ledger, for fee reporting only.
+ * The ledger: fee reporting, and the one read the staking panel needs.
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **BOOKKEEPING MIRRORS THE CHAIN, NEVER THE REVERSE** — 19-new-products.md §2.3.1.
@@ -29,8 +29,22 @@ import type { EntryKind } from '@cloudsforge/contracts-money'
  * identity
  * refuses to boot on a name the registry does not have — or has deprecated, which `Scope` alone
  * would not have caught.
+ *
+ * ── BOTH SCOPES, BECAUSE THIS CLIENT DOES BOTH THINGS ────────────────────────────────────────
+ *
+ * `balances()` below calls `GET /accounts/:subject/balances`, which micro-ledger gates on
+ * `READ_SCOPE` — `ledger:read`, server.ts:81. This list named only `ledger:post` from the day the
+ * file was written for fee reporting, and was not widened when the staking panel's balance read
+ * was added. The compose grant carried `ledger:read` anyway, so the call worked in production and
+ * nothing user-facing was wrong; what it broke was the derivation. `derive-grants.mjs --check`
+ * reported `foresight: compose grants ledger:read, which no module in that service asks for` and
+ * has failed estate-ci since 2026-08-12 — and the obvious reading of that sentence, that compose
+ * over-grants, is backwards. Taking the grant away would have 403'd the panel.
+ *
+ * So: when this file gains a call, widen this list in the same commit. The declaration is the
+ * thing the estate mints from, and a stale one is an outage waiting for somebody to trust it.
  */
-export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze(['ledger:post'])
+export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze(['ledger:post', 'ledger:read'])
 
 export class LedgerRefusedError extends Error {
   readonly code: string
