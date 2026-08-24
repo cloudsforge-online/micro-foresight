@@ -15,6 +15,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
@@ -83,9 +84,14 @@ before(async () => {
   sql = openDb()
   await migrateTestDb(sql)
   policy = fakePolicy()
+  const testQueue = new JobQueue(sql as unknown as JobsSql, { owner: 'test', leaseMs: 60_000 })
   const deps: ServerDeps = {
-    sql: db(sql),
-    queue: new JobQueue(sql as unknown as JobsSql, { owner: 'test', leaseMs: 60_000 }),
+    sql: singleNetworkSql(db(sql)),
+    singleNetwork: 'mainnet' as const,
+    queue: testQueue,
+    // One queue, presented as the per-network selector: the suites run against a single
+    // database, so both networks resolve to it. What is under test is that a route ASKS.
+    queueFor: () => testQueue,
     verifier: fakeVerifier(),
     lifecycle: new Lifecycle({}),
     logger: quietLogger(),
@@ -425,3 +431,12 @@ test('every response carries the request id it will be quoted by', { skip }, asy
   // Health and a pool are point-in-time facts; a cached one is the lie this stops telling.
   assert.equal(response.headers.get('cache-control'), 'no-store')
 })
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+export function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}

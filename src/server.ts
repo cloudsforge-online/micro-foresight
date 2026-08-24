@@ -41,6 +41,8 @@ import {
 } from '@cloudsforge/auth'
 import type { Network } from '@cloudsforge/contracts-chain'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { CATEGORIES, CATEGORY_VERSION, REFUSALS } from './categories.ts'
@@ -122,8 +124,19 @@ import {
 } from './resolve.ts'
 
 export interface ServerDeps {
-  readonly sql: Db
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
+  /** Boot-time value; `forRequest` replaces it. An enqueue is a WRITE, so the queue is per-network. */
   readonly queue: JobQueue
+  readonly queueFor: (network: Network) => JobQueue
   readonly verifier: Verifier
   readonly lifecycle: Lifecycle
   readonly logger: Logger
@@ -132,6 +145,14 @@ export interface ServerDeps {
   readonly sourceProbe: SourceProbe
   readonly producer: string
   readonly chain: ChainId
+  /**
+   * The boot-time default, from `FORESIGHT_NETWORK`. `forRequest` replaces it with the network the
+   * gateway stamped.
+   *
+   * Not a label: it selects the CHAIN a market is proposed and resolved on, and it is half of the
+   * lease key that stops two replicas posting the same resolution. A pod serving both estates has
+   * no process-wide answer to "which chain am I on".
+   */
   readonly network: Network
   readonly defaultFeeBps: number
   readonly defaultDisputeWindowSeconds: number
@@ -366,7 +387,34 @@ interface RequestContext {
   readonly requestId: string
   readonly log: Logger
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff —
+ * which is exactly what agora's first build did: 500 on every probe, container never ready.
+ *
+ * A literal SET rather than a prefix, because this is an exemption from a data boundary and
+ * widening it should be a deliberate edit. Every member must answer without touching the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string
@@ -434,23 +482,61 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, forRequest(deps, network))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -466,6 +552,17 @@ export function createServer(deps: ServerDeps): Server {
  *   * **503** — an upstream is unreachable, INCLUDING policy. Retrying IS the right response, which
  *     is what 503 tells a client and 500 does not.
  */
+/**
+ * The deps a REQUEST sees.
+ *
+ * Two things move: the queue, because an enqueue is a write, and the NETWORK, because it selects
+ * the chain a resolution is posted to AND forms half of `resolutionLeaseKey`. Sharing one key
+ * across estates would let a mainnet resolution job suppress a testnet one as a duplicate.
+ */
+function forRequest(deps: ServerDeps, network: Network): ServerDeps {
+  return { ...deps, network, queue: deps.queueFor(network) }
+}
+
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   if (!route) {
     return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
@@ -660,7 +757,7 @@ function buildRoutes(): Route[] {
       const requested = ctx.url.searchParams.get('status')
       const status = requested === null ? null : parseStatus(requested)
       const limit = parseLimit(ctx.url.searchParams.get('limit'))
-      const markets = await listMarkets(deps.sql, status, limit)
+      const markets = await listMarkets(ctx.sql, status, limit)
       // The image reference is composed per response rather than stored composed, so a deployment
       // that gains a public studio address starts serving usable `bytesUrl`s without a backfill.
       return {
@@ -678,20 +775,20 @@ function buildRoutes(): Route[] {
      */
     define('GET', '/markets/:id', async (ctx, deps) => {
       const id = uuidParam(ctx, 'id')
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
-      const pool = await poolOf(deps.sql, id, market.chain as ChainId)
+      const pool = await poolOf(ctx.sql, id, market.chain as ChainId)
       // The OTHER book on the same question — see `custodialPoolView`. Served beside `pool` and
       // never folded into it: a reader staking from their CloudsForge balance is paid out of this
       // one, and until it was on the wire the page showed them a market they had staked on
       // reading `0` on both sides.
-      const custodialPool = custodialPoolView(await custodialPoolOf(deps.sql, id))
-      const idea = market.ideaId ? await findIdea(deps.sql, market.ideaId) : null
+      const custodialPool = custodialPoolView(await custodialPoolOf(ctx.sql, id))
+      const idea = market.ideaId ? await findIdea(ctx.sql, market.ideaId) : null
       // The house seed DISCLOSURE — 21 §5's sentence, served whenever a house stake exists
       // (21 §7.6), with the composed sentence, the amounts, the address and the evidence hashes.
       // Serving it is phase 1; foresight-web rendering it "with force" is the recorded later
       // client pass.
-      const houseSeed = await findHouseSeed(deps.sql, id)
+      const houseSeed = await findHouseSeed(ctx.sql, id)
       return {
         status: 200,
         body: {
@@ -723,10 +820,10 @@ function buildRoutes(): Route[] {
       const id = uuidParam(ctx, 'id')
       const address = ctx.params['address'] ?? ''
       if (!EVM_ADDRESS.test(address)) throw new BadRequestError('address must be a 20-byte hex address')
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
-      const position = await positionOf(deps.sql, id, address)
-      const pool = await poolOf(deps.sql, id, market.chain as ChainId)
+      const position = await positionOf(ctx.sql, id, address)
+      const pool = await poolOf(ctx.sql, id, market.chain as ChainId)
       return {
         status: 200,
         body: {
@@ -761,7 +858,7 @@ function buildRoutes(): Route[] {
       const amount = requireDecimal(body, 'amount')
       const outcome = requireInteger(body, 'outcome', 0, 1)
 
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       if (market.status !== 'open' || !market.contractAddress) {
         return errorReply(409, 'not_open', `this market is ${market.status}`, ctx.requestId)
@@ -825,8 +922,8 @@ function buildRoutes(): Route[] {
      * silently omits it — that omission is what makes somebody think the platform has never heard
      * of their coin.
      */
-    define('GET', '/stake-assets', async (_ctx, deps) => {
-      const assets = await listStakeAssets(deps.sql)
+    define('GET', '/stake-assets', async (ctx, deps) => {
+      const assets = await listStakeAssets(ctx.sql)
       return {
         status: 200,
         body: {
@@ -863,12 +960,12 @@ function buildRoutes(): Route[] {
       const assetCode = parseStakeAssetCode(body['asset'])
       const amount = requireWei(body, 'amount')
 
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       if (market.status !== 'open') {
         return errorReply(409, 'not_open', `this market is ${market.status}`, ctx.requestId)
       }
-      const asset = await findStakeAsset(deps.sql, assetCode)
+      const asset = await findStakeAsset(ctx.sql, assetCode)
       if (!asset) {
         return errorReply(404, 'unknown_asset', `${assetCode} is not a stake asset`, ctx.requestId)
       }
@@ -934,7 +1031,7 @@ function buildRoutes(): Route[] {
       // same key, and a key that did not carry the subject would answer the second one with the
       // first one's stake — somebody else's position, in somebody else's name.
       const key = `${subject}:${clientKey}`
-      const existing = await findStakeByKey(deps.sql, key)
+      const existing = await findStakeByKey(ctx.sql, key)
       if (existing) {
         // A retry replays. It does NOT re-price: answering a retry at a moved rate is how one user
         // action becomes two trades — `wallet/src/money.ts`'s conversion makes the same argument
@@ -945,7 +1042,7 @@ function buildRoutes(): Route[] {
         }
       }
 
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       const now = (deps.now ?? (() => new Date()))()
       if (market.status !== 'open') {
@@ -954,7 +1051,7 @@ function buildRoutes(): Route[] {
       if (market.closeTime.getTime() <= now.getTime()) {
         return errorReply(409, 'closed', 'this market has reached its close time', ctx.requestId)
       }
-      const asset = await findStakeAsset(deps.sql, assetCode)
+      const asset = await findStakeAsset(ctx.sql, assetCode)
       if (!asset) {
         return errorReply(404, 'unknown_asset', `${assetCode} is not a stake asset`, ctx.requestId)
       }
@@ -994,7 +1091,7 @@ function buildRoutes(): Route[] {
       const rates = await deps.pricing.stakeRates(assetCode)
       const quote = quoteStake({ asset, stakeAmount: amount, rates })
 
-      const stake = await withOutbox(deps.sql, deps.producer, async (tx) =>
+      const stake = await withOutbox(ctx.sql, deps.producer, async (tx) =>
         acceptStake(tx, {
           marketId: id,
           subject,
@@ -1032,11 +1129,11 @@ function buildRoutes(): Route[] {
         // here would free the key and let a second entry post against the same money.
         // ────────────────────────────────────────────────────────────────────────────────────
         if (err instanceof LedgerRefusedError) {
-          await deps.sql`delete from custodial_stakes where id = ${stake.id} and state = 'accepted'`
+          await ctx.sql`delete from custodial_stakes where id = ${stake.id} and state = 'accepted'`
         }
         throw err
       }
-      const recorded = await recordEscrowEntry(deps.sql, stake.id, entry.id)
+      const recorded = await recordEscrowEntry(ctx.sql, stake.id, entry.id)
 
       return {
         status: 201,
@@ -1078,7 +1175,7 @@ function buildRoutes(): Route[] {
         )
       }
       const subject = subjectOf(principal)
-      const assets = await listStakeAssets(deps.sql)
+      const assets = await listStakeAssets(ctx.sql)
       let held: readonly { assetCode: string; purpose: string; amount: string; status: string }[] = []
       let degraded = false
       try {
@@ -1115,7 +1212,7 @@ function buildRoutes(): Route[] {
     define('GET', '/markets/:id/custodial-position', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       const id = uuidParam(ctx, 'id')
-      const position = await custodialPositionOf(deps.sql, id, subjectOf(principal))
+      const position = await custodialPositionOf(ctx.sql, id, subjectOf(principal))
       return {
         status: 200,
         body: {
@@ -1139,7 +1236,7 @@ function buildRoutes(): Route[] {
       if (status !== 'proposed' && status !== 'approved' && status !== 'discarded') {
         throw new BadRequestError('status must be proposed, approved or discarded')
       }
-      const ideas = await listIdeas(deps.sql, status, parseLimit(ctx.url.searchParams.get('limit')))
+      const ideas = await listIdeas(ctx.sql, status, parseLimit(ctx.url.searchParams.get('limit')))
       return { status: 200, body: { ideas: ideas.map((idea) => ideaView(idea, deps.studioPublicUrl)) } }
     }),
 
@@ -1149,7 +1246,7 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
       const now = (deps.now ?? (() => new Date()))()
       const idea = await insertIdea(
-        deps.sql,
+        ctx.sql,
         {
           question: requireString(body, 'question'),
           resolutionCriteria: requireString(body, 'resolutionCriteria'),
@@ -1171,7 +1268,7 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
       const now = (deps.now ?? (() => new Date()))()
       const idea = await editIdea(
-        deps.sql,
+        ctx.sql,
         id,
         {
           question: requireString(body, 'question'),
@@ -1193,7 +1290,7 @@ function buildRoutes(): Route[] {
       const id = uuidParam(ctx, 'id')
       const body = await readJson(ctx.req)
       const now = (deps.now ?? (() => new Date()))()
-      const idea = await approveIdea(deps.sql, id, operatorOf(principal), optionalString(body, 'note') ?? null, now)
+      const idea = await approveIdea(ctx.sql, id, operatorOf(principal), optionalString(body, 'note') ?? null, now)
       return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
     }),
 
@@ -1204,7 +1301,7 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
       const now = (deps.now ?? (() => new Date()))()
       const idea = await discardIdea(
-        deps.sql,
+        ctx.sql,
         id,
         operatorOf(principal),
         requireString(body, 'refusalId'),
@@ -1223,7 +1320,7 @@ function buildRoutes(): Route[] {
       const ideaId = optionalString(body, 'ideaId')
       if (ideaId !== undefined && !UUID.test(ideaId)) throw new BadRequestError('ideaId must be a uuid')
       const market = await createDraft(
-        deps.sql,
+        ctx.sql,
         {
           ...(ideaId !== undefined ? { ideaId } : {}),
           question: requireString(body, 'question'),
@@ -1307,7 +1404,7 @@ function buildRoutes(): Route[] {
             ctx.requestId,
           )
         }
-        const plannedToday = await seedsPlannedTodayWei(deps.sql)
+        const plannedToday = await seedsPlannedTodayWei(ctx.sql)
         if (plannedToday + seedPerOutcomeWei > policy.perDayWei) {
           return errorReply(
             409,
@@ -1319,7 +1416,7 @@ function buildRoutes(): Route[] {
       }
 
       const houseAddress = deps.houseAddress
-      const result = await withOutbox(deps.sql, deps.producer, async (tx) => {
+      const result = await withOutbox(ctx.sql, deps.producer, async (tx) => {
         const market = await approveMarket(tx, id, operatorOf(principal), now, ctx.requestId)
         const seed =
           seedPerOutcomeWei !== null && houseAddress
@@ -1347,13 +1444,13 @@ function buildRoutes(): Route[] {
       requireAdmin(await authenticate(ctx, deps))
       const id = uuidParam(ctx, 'id')
       const key = idempotencyKeyOf(ctx)
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       if (market.status !== 'approved') {
         return errorReply(409, 'not_approved', `a market is deployed once approved; this one is ${market.status}`, ctx.requestId)
       }
 
-      const outcome = await withIdempotency<Record<string, unknown>>(deps.sql, {
+      const outcome = await withIdempotency<Record<string, unknown>>(ctx.sql, {
         originatingService: deps.producer,
         route: 'POST /markets/:id/deploy',
         clientKey: key,
@@ -1387,7 +1484,7 @@ function buildRoutes(): Route[] {
       requireAdmin(principal)
       const id = uuidParam(ctx, 'id')
       const now = (deps.now ?? (() => new Date()))()
-      const result = await withOutbox(deps.sql, deps.producer, async (tx, emit) => {
+      const result = await withOutbox(ctx.sql, deps.producer, async (tx, emit) => {
         const market = await openMarket(tx, emit, id, operatorOf(principal), now, ctx.requestId)
         const planned = await findHouseSeed(tx, id)
         const seed =
@@ -1416,7 +1513,7 @@ function buildRoutes(): Route[] {
       const id = uuidParam(ctx, 'id')
       const body = await readJson(ctx.req)
       const outcome = requireInteger(body, 'outcome', 0, 1)
-      const resolution = await planResolution(deps.sql, deps.sourceProbe, {
+      const resolution = await planResolution(ctx.sql, deps.sourceProbe, {
         marketId: id,
         outcome: outcome as 0 | 1,
         rationale: requireString(body, 'rationale'),
@@ -1444,7 +1541,7 @@ function buildRoutes(): Route[] {
     define('GET', '/markets/:id/resolution', async (ctx, deps) => {
       requireAdmin(await authenticate(ctx, deps))
       const id = uuidParam(ctx, 'id')
-      const resolution = await findResolutionByMarket(deps.sql, id)
+      const resolution = await findResolutionByMarket(ctx.sql, id)
       if (!resolution) return errorReply(404, 'not_found', 'no resolution has been planned', ctx.requestId)
       // Narrowed, never the row: the row carries a bigint nonce that JSON.stringify throws on, and
       // the raw transaction. See `resolutionView` for both defects.
@@ -1464,7 +1561,7 @@ function buildRoutes(): Route[] {
       requireAdmin(principal)
       const id = uuidParam(ctx, 'id')
       const body = await readJson(ctx.req)
-      const market = await findMarket(deps.sql, id)
+      const market = await findMarket(ctx.sql, id)
       if (!market) return errorReply(404, 'not_found', 'no market with that id', ctx.requestId)
       if (market.contractAddress) {
         return errorReply(
@@ -1475,7 +1572,7 @@ function buildRoutes(): Route[] {
         )
       }
       const now = (deps.now ?? (() => new Date()))()
-      const voided = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+      const voided = await withOutbox(ctx.sql, deps.producer, async (tx, emit) =>
         voidMarket(tx, emit, id, requireString(body, 'reason'), operatorOf(principal), now, ctx.requestId),
       )
       return { status: 200, body: { market: publicView(voided, deps.studioPublicUrl) } }
@@ -1532,7 +1629,7 @@ function buildRoutes(): Route[] {
       const id = uuidParam(ctx, 'id')
       const image = parseImageReference(await readJson(ctx.req))
       const now = (deps.now ?? (() => new Date()))()
-      const market = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+      const market = await withOutbox(ctx.sql, deps.producer, async (tx, emit) =>
         setMarketImage(tx, emit, id, image, operatorOf(principal), now, ctx.requestId),
       )
       return { status: 200, body: { market: publicView(market, deps.studioPublicUrl) } }
@@ -1550,7 +1647,7 @@ function buildRoutes(): Route[] {
       requireAdmin(principal)
       const id = uuidParam(ctx, 'id')
       const now = (deps.now ?? (() => new Date()))()
-      const market = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+      const market = await withOutbox(ctx.sql, deps.producer, async (tx, emit) =>
         setMarketImage(tx, emit, id, null, operatorOf(principal), now, ctx.requestId),
       )
       return { status: 200, body: { market: publicView(market, deps.studioPublicUrl) } }
@@ -1562,7 +1659,7 @@ function buildRoutes(): Route[] {
       const id = uuidParam(ctx, 'id')
       const image = parseImageReference(await readJson(ctx.req))
       const now = (deps.now ?? (() => new Date()))()
-      const idea = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+      const idea = await withOutbox(ctx.sql, deps.producer, async (tx, emit) =>
         setIdeaImage(tx, emit, id, image, operatorOf(principal), now, ctx.requestId),
       )
       return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }
@@ -1573,7 +1670,7 @@ function buildRoutes(): Route[] {
       requireAdmin(principal)
       const id = uuidParam(ctx, 'id')
       const now = (deps.now ?? (() => new Date()))()
-      const idea = await withOutbox(deps.sql, deps.producer, async (tx, emit) =>
+      const idea = await withOutbox(ctx.sql, deps.producer, async (tx, emit) =>
         setIdeaImage(tx, emit, id, null, operatorOf(principal), now, ctx.requestId),
       )
       return { status: 200, body: { idea: ideaView(idea, deps.studioPublicUrl) } }

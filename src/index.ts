@@ -19,7 +19,7 @@
  */
 
 import postgres from 'postgres'
-import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
+import { assertSchemaAtLeast, type Sql as DbSql , networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Verifier } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
@@ -76,20 +76,37 @@ logger.info('starting', {
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the
 //    assertion is a query, and before the Lifecycle because the readiness probe closes over it.
-const sql = postgres(env.databaseUrl, {
+const poolOptions = {
   max: env.databasePoolMax,
   // postgres.js writes notices to stderr as unstructured text by default, which is how a connection
   // string ends up in a log the collector cannot parse.
   onnotice: () => {},
-})
+}
+const sql = postgres(env.databaseUrl, poolOptions)
 
-// 4. Assert the schema. This does NOT migrate. Failing here rather than serving is the point.
-try {
-  await assertSchemaAtLeast(sql as unknown as DbSql, SCHEMA_VERSION)
-} catch (err) {
-  logger.fatal('schema assertion failed', { err, required: SCHEMA_VERSION })
-  await sql.end({ timeout: 5 }).catch(() => {})
-  process.exit(1)
+// ── ONE HANDLE PER NETWORK THIS DEPLOYMENT SERVES ────────────────────────────────────────────
+//
+// `FORESIGHT_DATABASE_URL_TESTNET` unset is the single-network case, which is every deployment until the
+// consolidation reaches this service. `networkSql` then holds one handle and REFUSES a testnet
+// request rather than answering it out of mainnet rows — substituting would be a query that
+// SUCCEEDS against the other estate and says nothing.
+const sqlTestnet = env.databaseUrlTestnet ? postgres(env.databaseUrlTestnet, poolOptions) : undefined
+
+// 4. Assert the schema on EVERY network. This does NOT migrate. Failing here rather than serving
+//    is the point — and a testnet database behind on migrations would otherwise be discovered by
+//    the first testnet request rather than at boot.
+for (const [network, handle] of [
+  ['mainnet', sql] as const,
+  ...(sqlTestnet ? ([['testnet', sqlTestnet]] as const) : []),
+]) {
+  try {
+    await assertSchemaAtLeast(handle as unknown as DbSql, SCHEMA_VERSION)
+  } catch (err) {
+    logger.fatal('schema assertion failed', { err, required: SCHEMA_VERSION, network })
+    await sql.end({ timeout: 5 }).catch(() => {})
+    await sqlTestnet?.end({ timeout: 5 }).catch(() => {})
+    process.exit(1)
+  }
 }
 
 // 5. The upstreams. Constructed before the Lifecycle so its probes can close over their URLs, and
@@ -207,13 +224,41 @@ if (env.pricingUrl !== undefined) {
 // 7. The dependency bundles, built once and shared so the routes and the worker cannot disagree
 //    about which network they are on or which bounds they are enforcing.
 const db = sql as unknown as Db
-const queue = new JobQueue(sql as unknown as JobsSql, {
-  owner: env.instanceId,
-  // Longer than the default 60 seconds because a deploy job holds its lease across a node round
-  // trip, a custody round trip and a broadcast. The handler renews between steps, so this is the
-  // ceiling on a STEP rather than on the job.
-  leaseMs: 120_000,
-})
+// ── ONE QUEUE PER NETWORK ────────────────────────────────────────────────────────────────────
+//
+// An enqueue is a WRITE, and a resolution job is the most consequential one this service makes:
+// it posts an outcome to a chain. `resolutionLeaseKey(chain, network)` is also half the key that
+// stops two replicas posting the same resolution, so one shared queue would let a mainnet job
+// suppress a testnet one as a duplicate.
+const queueFor = (handle: typeof sql) =>
+  new JobQueue(handle as unknown as JobsSql, {
+    owner: env.instanceId,
+    // Longer than the default 60 seconds because a deploy job holds its lease across a node round
+    // trip, a custody round trip and a broadcast. The handler renews between steps, so this is the
+    // ceiling on a STEP rather than on the job.
+    leaseMs: 120_000,
+  })
+
+/** One plane per network: pool, handle, queue. Nothing crosses between two. */
+const planes = [
+  { network: 'mainnet' as const, pool: sql, db, queue: queueFor(sql) },
+  ...(sqlTestnet
+    ? [
+        {
+          network: 'testnet' as const,
+          pool: sqlTestnet,
+          db: sqlTestnet as unknown as Db,
+          queue: queueFor(sqlTestnet),
+        },
+      ]
+    : []),
+]
+const planeFor = (network: 'mainnet' | 'testnet') => {
+  const plane = planes.find((p) => p.network === network)
+  if (!plane) throw new Error(`no plane for network ${network}`)
+  return plane
+}
+const queue = planeFor('mainnet').queue
 
 // What the recurring schedule is computed from. Declared here, before the routes, because
 // `beforeScrape` reads it and because `rescheduleRecurring` and `seedRecurring` below must be given
@@ -222,11 +267,18 @@ const schedule = { chain: CHAIN, network: env.network, proposeEveryMinutes: env.
 
 const bounds = { minGasPriceWei: env.minGasPriceWei, maxGasPriceWei: env.maxGasPriceWei }
 
-const deploy: DeployDeps = {
-  sql: db,
+/**
+ * The deploy worker's dependencies, per network.
+ *
+ * `network` selects the CHAIN a market contract is deployed to and the custody key that signs it.
+ * One worker per network, each closed over its own handle and its own network, is the only shape
+ * where a testnet market cannot deploy against mainnet.
+ */
+const deployFor = (handle: Db, network: 'mainnet' | 'testnet'): DeployDeps => ({
+  sql: handle,
   producer: SERVICE,
   owner: env.instanceId,
-  network: env.network,
+  network,
   custody,
   rpc,
   bounds,
@@ -236,12 +288,12 @@ const deploy: DeployDeps = {
   leaseMs: 120_000,
   stuckMs: env.stuckMinutes * 60_000,
   enabled: env.deploysEnabled,
-  logger: logger.child({ component: 'deploy' }),
+  logger: logger.child({ component: 'deploy', network }),
   metrics,
-}
+})
 
-const resolve: ResolveDeps = {
-  sql: db,
+const resolveFor = (handle: Db): ResolveDeps => ({
+  sql: handle,
   owner: env.instanceId,
   custody,
   rpc,
@@ -254,15 +306,15 @@ const resolve: ResolveDeps = {
   enabled: env.deploysEnabled,
   logger: logger.child({ component: 'resolve' }),
   metrics,
-}
+})
 
-const mirror: MirrorDeps = {
-  sql: db,
+const mirrorFor = (handle: Db): MirrorDeps => ({
+  sql: handle,
   indexer,
   pageSize: 100,
   logger: logger.child({ component: 'mirror' }),
   metrics,
-}
+})
 
 const sourceProbe = httpSourceProbe(env.upstreamDeadlineMs)
 
@@ -270,8 +322,16 @@ const sourceProbe = httpSourceProbe(env.upstreamDeadlineMs)
 //    the stores are real rather than a lazily-connected surprise on the first request.
 const verifier = new Verifier({ jwksUrl: env.identityJwksUrl, issuer: env.identityIssuer })
 const server = createServer({
-  sql: db,
+  // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request.
+  sql: networkSql({
+    mainnet: sql as unknown as RuntimeSql,
+    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+  }),
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
+  // Boot-time values; `forRequest` replaces both with this request's network before any route sees
+  // them. `network` is not a label here — it selects the chain a resolution is posted to.
   queue,
+  queueFor: (network: 'mainnet' | 'testnet') => planeFor(network).queue,
   verifier,
   lifecycle,
   logger,
@@ -350,22 +410,22 @@ const server = createServer({
 // 9. The job runner, started before `listen()`. Background work is claimed under a lease, so a
 //    replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to
 //    the Lifecycle for exactly that.
-const jobDeps: JobDeps = {
-  sql: db,
-  queue,
+const jobDepsFor = (plane: (typeof planes)[number]): JobDeps => ({
+  sql: plane.db,
+  queue: plane.queue,
   producer: SERVICE,
-  network: env.network,
+  network: plane.network,
   chain: CHAIN,
   logger,
   metrics,
   proposer,
   proposalBatchSize: env.proposerBatchSize,
   proposeEveryMinutes: env.proposeEveryMinutes,
-  deploy,
-  resolve,
-  mirror,
+  deploy: deployFor(plane.db, plane.network),
+  resolve: resolveFor(plane.db),
+  mirror: mirrorFor(plane.db),
   ledger,
-}
+})
 
 // ────────────────────────────────────────────────────────────────────────────────────────────────
 // **THE RE-ARM, AND WHY IT IS HERE RATHER THAN IN THE HANDLERS.**
@@ -384,41 +444,52 @@ const jobDeps: JobDeps = {
 // this trap and this is its fix, unchanged; six services already do it this way and there is no
 // reason for a seventh pattern.
 // ────────────────────────────────────────────────────────────────────────────────────────────────
-const reschedule = rescheduleRecurring(queue, logger, schedule)
-
-const runner = new JobRunner({
-  queue,
-  concurrency: 4,
-  pollMs: env.jobPollMs,
-  shouldClaim: () => lifecycle.claimingJobs,
-  onEvent: (event) => {
-    if (event.kind) {
-      if (event.type === 'claimed') metrics.increment('jobs_claimed_total', { kind: event.kind })
-      if (event.type === 'completed') metrics.increment('jobs_completed_total', { kind: event.kind })
-      if (event.type === 'failed') metrics.increment('jobs_failed_total', { kind: event.kind })
-      if (event.type === 'dead') metrics.increment('jobs_dead_total', { kind: event.kind })
-      if (event.durationMs !== undefined) {
-        metrics.observe('jobs_duration_ms', event.durationMs, { kind: event.kind })
+// ── ONE RUNNER PER NETWORK ──────────────────────────────────────────────────────────────────
+//
+// Bulkheaded, and here that is not a tidiness argument: `deploy.network` and `jobDeps.network`
+// select the CHAIN a market contract is deployed to and an outcome posted to. One runner over one
+// queue would have every testnet market resolving against mainnet. `resolutionLeaseKey(chain,
+// network)` also stops two replicas posting the same resolution — sharing a queue across estates
+// would let a mainnet job suppress a testnet one as a duplicate.
+const runners = planes.map((plane) => {
+  const scheduleFor = { chain: CHAIN, network: plane.network, proposeEveryMinutes: env.proposeEveryMinutes }
+  const reschedule = rescheduleRecurring(plane.queue, logger, scheduleFor)
+  const runner = new JobRunner({
+    queue: plane.queue,
+    concurrency: 4,
+    pollMs: env.jobPollMs,
+    shouldClaim: () => lifecycle.claimingJobs,
+    onEvent: (event) => {
+      if (event.kind) {
+        const labels = { kind: event.kind, network: plane.network }
+        if (event.type === 'claimed') metrics.increment('jobs_claimed_total', labels)
+        if (event.type === 'completed') metrics.increment('jobs_completed_total', labels)
+        if (event.type === 'failed') metrics.increment('jobs_failed_total', labels)
+        if (event.type === 'dead') metrics.increment('jobs_dead_total', labels)
+        if (event.durationMs !== undefined) {
+          metrics.observe('jobs_duration_ms', event.durationMs, labels)
+        }
       }
-    }
-    if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
-      logger.error('job failure', { ...event })
-    }
-    reschedule(event)
-  },
-})
+      if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
+        logger.error('job failure', { ...event, network: plane.network })
+      }
+      reschedule(event)
+    },
+  })
 
-registerHandlers(
-  jobDeps,
-  createRelay({
-    sql: db,
-    logger: logger.child({ component: 'relay' }),
-    signingSecret: env.outboxSigningSecret,
-  }),
-  (kind, handler) => runner.register(kind, handler),
-)
-await seedRecurring(queue, schedule)
-runner.start()
+  registerHandlers(
+    jobDepsFor(plane),
+    createRelay({
+      sql: plane.db,
+      logger: logger.child({ component: 'relay', network: plane.network }),
+      signingSecret: env.outboxSigningSecret,
+    }),
+    (kind, handler) => runner.register(kind, handler),
+  )
+  return { runner, schedule: scheduleFor, queue: plane.queue }
+})
+for (const r of runners) await seedRecurring(r.queue, r.schedule)
+for (const r of runners) r.runner.start()
 
 // 10. Listen. Last of the construction steps, because a socket that accepts before its dependencies
 //     exist is a socket that answers 500.
@@ -437,12 +508,12 @@ lifecycle.markReady()
 //     safe but wastes a custody signature and a nonce read. Then the pool closes with nothing left
 //     to use it.
 lifecycle.onShutdown(async () => {
-  await sql.end({ timeout: 5 })
+  await Promise.all(planes.map((plane) => plane.pool.end({ timeout: 5 })))
   logger.info('database pool closed')
 })
 lifecycle.onShutdown(async () => {
-  const clean = await runner.stop(20_000)
-  logger.info('job runner stopped', { clean })
+  const clean = (await Promise.all(runners.map((r) => r.runner.stop(20_000)))).every(Boolean)
+  logger.info('job runners stopped', { clean, runners: runners.length })
 })
 lifecycle.onShutdown(
   () =>

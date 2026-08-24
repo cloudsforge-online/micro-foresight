@@ -16,6 +16,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
+import { singleNetworkSql } from './server.test.ts'
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
@@ -129,9 +130,14 @@ before(async () => {
   pricing = fakePricing()
   ledger = fakeLedger()
   policy = fakePolicy()
+  const testQueue = new JobQueue(sql as unknown as JobsSql, { owner: 'test', leaseMs: 60_000 })
   const deps: ServerDeps = {
-    sql: db(sql),
-    queue: new JobQueue(sql as unknown as JobsSql, { owner: 'test', leaseMs: 60_000 }),
+    sql: singleNetworkSql(db(sql)),
+    singleNetwork: 'mainnet' as const,
+    queue: testQueue,
+    // One queue, presented as the per-network selector: the suites run against a single
+    // database, so both networks resolve to it. What is under test is that a route ASKS.
+    queueFor: () => testQueue,
     verifier: fakeVerifier(),
     lifecycle: new Lifecycle({}),
     logger: quietLogger(),
