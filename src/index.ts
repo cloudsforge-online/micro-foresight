@@ -38,6 +38,17 @@ import type { MirrorDeps } from './mirror.ts'
 import type { ChainId } from './chains.ts'
 import type { Db } from './outbox.ts'
 
+// ── WHICH ESTATE THIS DEPLOYMENT IS ─────────────────────────────────────────────────────────
+//
+// Every per-network map in this file keys its primary entry by THIS, never by the literal
+// `mainnet`. Same image, same code, different env: a testnet pod that hardcodes the key holds
+// its own database and its own queue under the other estate's name, and then refuses — or, when
+// the throw escapes a request listener, DIES — on every request the gateway correctly stamped.
+//
+// It happened twice. The handle, then the job plane.
+const ownNetwork = (env.singleNetwork || 'mainnet') as 'mainnet' | 'testnet'
+
+
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
 //    exited with a structured line naming the variable.
 
@@ -96,8 +107,8 @@ const sqlTestnet = env.databaseUrlTestnet ? postgres(env.databaseUrlTestnet, poo
 //    is the point — and a testnet database behind on migrations would otherwise be discovered by
 //    the first testnet request rather than at boot.
 for (const [network, handle] of [
-  ['mainnet', sql] as const,
-  ...(sqlTestnet ? ([['testnet', sqlTestnet]] as const) : []),
+  [ownNetwork, sql] as const,
+  ...(sqlTestnet && ownNetwork !== 'testnet' ? ([['testnet', sqlTestnet]] as const) : []),
 ]) {
   try {
     await assertSchemaAtLeast(handle as unknown as DbSql, SCHEMA_VERSION)
@@ -241,8 +252,8 @@ const queueFor = (handle: typeof sql) =>
 
 /** One plane per network: pool, handle, queue. Nothing crosses between two. */
 const planes = [
-  { network: 'mainnet' as const, pool: sql, db, queue: queueFor(sql) },
-  ...(sqlTestnet
+  { network: ownNetwork, pool: sql, db, queue: queueFor(sql) },
+  ...(sqlTestnet && ownNetwork !== 'testnet'
     ? [
         {
           network: 'testnet' as const,
@@ -258,7 +269,7 @@ const planeFor = (network: 'mainnet' | 'testnet') => {
   if (!plane) throw new Error(`no plane for network ${network}`)
   return plane
 }
-const queue = planeFor('mainnet').queue
+const queue = planeFor(ownNetwork).queue
 
 // What the recurring schedule is computed from. Declared here, before the routes, because
 // `beforeScrape` reads it and because `rescheduleRecurring` and `seedRecurring` below must be given
@@ -321,23 +332,11 @@ const sourceProbe = httpSourceProbe(env.upstreamDeadlineMs)
 // 8. Routes. After the Lifecycle so the health handlers report real state, and after the pool so
 //    the stores are real rather than a lazily-connected surprise on the first request.
 const verifier = new Verifier({ jwksUrl: env.identityJwksUrl, issuer: env.identityIssuer })
-// ── WHICH ESTATE THIS DEPLOYMENT IS ─────────────────────────────────────────────────────────
-//
-// The `networkSql` key below used to be the literal `mainnet`. Same image, same code,
-// different env — so the TESTNET pod registered its testnet DSN under the name `mainnet` and
-// then refused every request the gateway stamped `CF-Network: testnet`, because it genuinely
-// held no handle by that name. Five services crash-looped on it within ten minutes of the
-// first deploy: the refusal was right, the registration was wrong.
-//
-// `CF_NETWORK_SINGLE` is how a single-network pod says which estate it is. The render sets it
-// for every deployment; `mainnet` remains the default only for a bare `pnpm dev`.
-const ownNetwork = (env.singleNetwork || 'mainnet') as 'mainnet' | 'testnet'
-
 const server = createServer({
   // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request.
   sql: networkSql({
     [ownNetwork]: sql as unknown as RuntimeSql,
-    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+    ...(sqlTestnet && ownNetwork !== 'testnet' ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
   }),
   // The fallback for a request with no `CF-Network` header — which is EVERY service-to-service
   // call, because those go container to container and never reach the gateway that stamps one.
