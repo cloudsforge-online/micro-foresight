@@ -32,7 +32,7 @@
     "agree byte-for-byte about a chain id: a skew there is not a 500, it is a market contract bound",
     "to the wrong network holding stakes nobody can claim.",
     "",
-    "There is no chain library in the RUNTIME dependencies — no ethers, no viem. This service builds",
+    "There is no chain library in the RUNTIME dependencies \u2014 no ethers, no viem. This service builds",
     "ONE EVM transaction shape (a legacy zero-value contract creation) and hands it to custody as a",
     "JSON object; custody is the only place a private key exists and therefore the only place a",
     "serialiser is needed. What is left is keccak256, for EIP-55, for the transaction id and for the",
@@ -50,6 +50,7 @@
     "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/contracts-money": "link:../contracts/packages/money",
     "@cloudsforge/db": "link:../runtime/packages/db",
+    "@cloudsforge/evm": "link:../runtime/packages/evm",
     "@cloudsforge/http": "link:../runtime/packages/http",
     "@cloudsforge/jobs": "link:../runtime/packages/jobs",
     "@cloudsforge/lifecycle": "link:../runtime/packages/lifecycle",
@@ -67,8 +68,8 @@
     "the compiled bytecode. The alternatives were worse. Hardhat and Foundry each bring a toolchain",
     "and a second build system into a repository whose whole compile step is 90 lines of solc; a",
     "real Hearth node cannot be required by CI, and a suite that skips when a node is absent proves",
-    "nothing on the one machine that matters. The invariants below — that a pool sums exactly, that",
-    "a second claim reverts, that resolution before close reverts — are statements about EXECUTED",
+    "nothing on the one machine that matters. The invariants below \u2014 that a pool sums exactly, that",
+    "a second claim reverts, that resolution before close reverts \u2014 are statements about EXECUTED",
     "bytecode, and there is no way to make them without an EVM."
   ],
   "devDependencies": {

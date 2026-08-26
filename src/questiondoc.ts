@@ -26,7 +26,7 @@
  * strings are UTF-8 with no normalisation surprises left implicit.
  */
 
-import { keccak256 } from './keccak.ts'
+import { keccak256 } from '@cloudsforge/evm'
 
 export interface QuestionDocument {
   /** The question, as a bettor reads it. Must be answerable YES or NO. */
